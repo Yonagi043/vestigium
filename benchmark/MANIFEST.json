@@ -1,0 +1,73 @@
+{
+ "name": "Vestigium public development questions",
+ "version": "1.3.1",
+ "built": "2026-10-22",
+ "license": "CC-BY-4.0",
+ "sets": [
+  {
+   "set": "old57",
+   "questions": 57,
+   "answerable": 52,
+   "unanswerable": 5,
+   "required_facets": 309,
+   "cross_document": 0,
+   "documents": 13
+  },
+  {
+   "set": "dev",
+   "questions": 15,
+   "answerable": 13,
+   "unanswerable": 2,
+   "required_facets": 61,
+   "cross_document": 0,
+   "documents": 7
+  },
+  {
+   "set": "dev2",
+   "questions": 25,
+   "answerable": 22,
+   "unanswerable": 3,
+   "required_facets": 125,
+   "cross_document": 0,
+   "documents": 10
+  },
+  {
+   "set": "dev3",
+   "questions": 10,
+   "answerable": 9,
+   "unanswerable": 1,
+   "required_facets": 60,
+   "cross_document": 2,
+   "documents": 9
+  },
+  {
+   "set": "vis_dev",
+   "questions": 15,
+   "answerable": 14,
+   "unanswerable": 1,
+   "required_facets": 43,
+   "cross_document": 0,
+   "documents": 12
+  }
+ ],
+ "documents": 30,
+ "document_checks": {
+  "match": 25,
+  "failed": 4,
+  "mismatch": 1
+ },
+ "files": {
+  "LICENSE": "35f0aac887516aa5444093e6306e969930b77931bc5a794bc3d921c91352317f",
+  "README.md": "c2eb249f99210387c3f1327c501b8843c9ef75212b9da80bb96582a85f1ce4a2",
+  "README_ZH.md": "d0d3895f1c4f7572b0a5697cb73b555d25433f1fcfaa2c9012f6aa0c9071a488",
+  "REPRODUCE.md": "9de08f3592a006544184d4108717d1058c1280cf99ca90c9cdb033b2fb8df4d5",
+  "REPRODUCE_ZH.md": "7b5b57ecac311db8c2432d3e104db13c42dc41ce85adb98929692a526c68172c",
+  "documents.csv": "6222d44dba241a07a0f8577545d6242cbf4e2a2e7d0e0edf54566f534587266f",
+  "documents.json": "9ac329176f7eda507ae55c57d02b600f747737f8ff7352073553600e0d7d4238",
+  "questions/dev.jsonl": "7ec689b0a63620eba2dd3dd1528157d924a2dca86f8a11847bdaea0ab5dae015",
+  "questions/dev2.jsonl": "e1c836436c6cb9e9985bc887be196c76653618802bc3a8b21d677ea9800648fc",
+  "questions/dev3.jsonl": "d8a07cf19c2af878bc29be728ab70b804c3771a9b3dad3873d3a18b64d1649f1",
+  "questions/old57.jsonl": "38133d4c234b238e6550da9ad39b3d1b42deb952f811c20a684067a259283f10",
+  "questions/vis_dev.jsonl": "a7504a29d9f5700428ac9b756a82e1fa568ab5ebdf77fa9da968531939e459bf"
+ }
+}

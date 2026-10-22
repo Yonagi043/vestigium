@@ -1,0 +1,15 @@
+{
+ "patterns": "private paths, network endpoints, credentials, held-out sets, internal data paths, unfilled placeholders and old command names; question ids against the hashed list of confidential ids",
+ "secret_ids_checked": 110,
+ "hits": {
+  "private paths": 0,
+  "network endpoints": 0,
+  "credentials": 0,
+  "held-out sets": 0,
+  "internal data paths": 0,
+  "unfilled placeholders": 0,
+  "old command names": 0,
+  "confidential question ids": 0
+ },
+ "examples": {}
+}

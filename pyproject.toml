@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vestigium"
+dynamic = ["version"]
+description = "Turn long PDFs into an addressable text graph that AI agents can navigate, with page-checkable answers (MCP server)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=2.3.0",
+    "mcp-types>=2.3.0",
+    "numpy>=2.0",
+    "opencc>=1.1",
+    "pdfplumber>=0.11",
+    "pillow>=10",
+    "pydantic>=2",
+    "pypdf>=5",
+    "pypdfium2>=4.30",
+    "rank-bm25>=0.2.2",
+    "rapidfuzz>=3",
+    "regex>=2024.1.1",
+    "snowballstemmer>=2.2",
+    "tiktoken>=0.7",
+    "uvicorn>=0.31.1",
+]
+
+[project.urls]
+Repository = "https://github.com/Yonagi043/vestigium"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+eval = []  # needs the claude CLI, and pdftoppm (poppler-utils) for condition P
+ingest = ["docling==2.117.0", "docling-core", "onnxruntime>=1.20", "rapidocr>=3.10"]
+
+[project.scripts]
+vestigium = "tglw.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "tglw.VERSION"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tglw*"]
+
+[tool.setuptools.package-data]
+"tglw.samples" = ["*.pdf", "*.bundle/*"]
