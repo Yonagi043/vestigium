@@ -15,11 +15,13 @@ from pathlib import Path
 from tglw import HOME_ENV
 
 SAMPLE = "gao-26-107790"
+RULES_SWITCH = "TGLW_RULES"  # the rule executor's switch; 0 = off (tglw.trace rules, executed in views)
 
 
 def clean_env(home: Path) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith(("TGL_", "TGLW_", "VESTIGIUM_"))}
-    return {**env, HOME_ENV: str(home), "PYTHONDONTWRITEBYTECODE": "1"}
+    keep = {RULES_SWITCH: os.environ[RULES_SWITCH]} if RULES_SWITCH in os.environ else {}
+    return {**env, **keep, HOME_ENV: str(home), "PYTHONDONTWRITEBYTECODE": "1"}
 
 
 def run(code: str, env: dict[str, str]) -> str:

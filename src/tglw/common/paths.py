@@ -9,7 +9,12 @@ as in a research checkout.
 A research checkout also carries _research_defaults.py (not released). Unless a library directory is set,
 that checkout's locations are used instead, and DATA is data/ of the checkout (WORK).
 
-Single locations can be moved either way: TGL_DOCS, TGL_CACHE, TGL_WORK, TGL_DATA.
+Single locations can be moved either way: TGL_DOCS, TGL_CACHE, TGL_WORK, TGL_DATA. In the product layout,
+tiktoken's vocabulary is cached in HOME/cache/tiktoken unless TIKTOKEN_CACHE_DIR (or DATA_GYM_CACHE_DIR) is set.
+
+Reading traces and agent-written rules stay on this machine, under the library directory in both
+layouts: trace_dir() is HOME/traces and rules_dir() HOME/rules, unless VESTIGIUM_TRACE_DIR or
+VESTIGIUM_RULES_DIR (TRACE_ENV, RULES_ENV) name another directory, as an evaluation run does for its traces.
 """
 
 from __future__ import annotations
@@ -49,3 +54,20 @@ else:
     WORK = _env("TGL_WORK", HOME)
 DATA = _env("TGL_DATA", WORK / "data")
 COMMON_DATA = DATA / "common"
+if not RESEARCH and not (os.environ.get("TIKTOKEN_CACHE_DIR") or os.environ.get("DATA_GYM_CACHE_DIR")):
+    # token counts need tiktoken's vocabulary, fetched once; keep it in the library, not in a temp directory a
+    # reboot may empty, so that after a first online run the server also starts offline
+    os.environ["TIKTOKEN_CACHE_DIR"] = str(HOME / "cache" / "tiktoken")
+
+TRACE_ENV = f"{HOME_ENV.removesuffix('_HOME')}_TRACE_DIR"
+RULES_ENV = f"{HOME_ENV.removesuffix('_HOME')}_RULES_DIR"
+
+
+def trace_dir() -> Path:
+    """Where reading traces are written; the environment is read at each call. Not created here."""
+    return _env(TRACE_ENV, HOME / "traces")
+
+
+def rules_dir() -> Path:
+    """Where agent-written rules are kept; the environment is read at each call. Not created here."""
+    return _env(RULES_ENV, HOME / "rules")

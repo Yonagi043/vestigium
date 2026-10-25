@@ -610,7 +610,7 @@ def _pagemap(name: str) -> dict[str, Any]:
 
 
 def _divisions(name: str) -> list[dict[str, Any]]:
-    """Starts of exhibits, appendices, volumes and parts found by task B (pagemap v2)."""
+    """Starts of exhibits, appendices, volumes and parts, from the divisions in task B's page map."""
     return _pagemap(name).get("divisions") or []
 
 

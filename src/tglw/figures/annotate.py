@@ -6,7 +6,9 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
-from . import counts, drawings, inline, ocr, switches
+from tglw.trace import record
+
+from . import counts, drawings, inline, ocr, switches, tracing
 
 _FIG = re.compile(r"^\[fig(\d+)[:\]]")
 
@@ -27,17 +29,35 @@ def read(name: str, text: str, addrs: Iterable[str] = ()) -> str:
         for ref, d in hints.items():
             for seg in v.block_segments(v.doc.by_ref[ref])[:1]:
                 caps[render_segment(v, seg)] = d
-        lines = []
+        lines, changed, hinted = [], [], []
         for line in text.split("\n"):
             m = _FIG.match(line) if fig_on else None
             b = v.doc.by_ref.get(f"#/pictures/{m.group(1)}") if m else None
             if b is not None and line == render_picture(v, b):
-                line = inline.picture_line(v, b, full=b.ref in direct)
+                new = inline.picture_line(v, b, full=b.ref in direct)
+                if new != line:
+                    changed.append((b.ref, new))
+                line = new
             lines.append(line)
             if line in caps:
                 lines.append(drawings.hint(name, caps[line].caption))
-        text = "\n".join(lines)
+                hinted.append(caps[line])
+        new_text = "\n".join(lines)
+        if changed or hinted:
+            tracing.guarded(_report_figs, changed, hinted, text, new_text)
+        text = new_text
     return ocr.mark_read(name, text)
+
+
+def _report_figs(changed: list[tuple[str, str]], hinted: list[drawings.Drawing], before: str, after: str) -> None:
+    figs, acted = [], set()
+    for ref, line in changed:
+        figs.append(inline.short(ref))
+        acted |= inline.applied(line, figs[-1])
+    figs += [d.target for d in hinted]
+    acted |= {"DRAWINGS"} if hinted else set()
+    record.sig("fig_hint", figs=figs)
+    record.dec("fig_hints", src="|".join(switches.env_name(k) for k in sorted(acted)), tokens=tracing.added(before, after))
 
 
 def outline(name: str, text: str) -> str:

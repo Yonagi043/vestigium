@@ -9,7 +9,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK = ROOT / "benchmark"  # the question package: only in the release tree, where it is checked too
-PAGES = ("QUICKSTART", "CLIENTS", "TOOLS", "RESULTS", "METHODS", "RELATED", "FAQ")
+PAGES = ("QUICKSTART", "CLIENTS", "TOOLS", "RESULTS", "METHODS", "RELATED", "FAQ", "LANGUAGE", "TRACES", "RULES", "RESULTS_0_1_1")
 PUBLIC = [ROOT / "README.md", ROOT / "README_ZH.md"] + [
     ROOT / "docs" / f"{page}{suffix}.md" for page in PAGES for suffix in ("", "_ZH")]
 _LINK = re.compile(r"\]\(([^)\s]+)\)")

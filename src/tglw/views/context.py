@@ -12,8 +12,10 @@ from collections import Counter
 from typing import Any, Callable
 
 from tglw.common.text import count_tokens
+from tglw.trace import record
 
 from .api import _block_tokens, _tok, _view, resolve
+from .tracing import guarded, report
 from .docview import DocView, Segment, short_ref
 
 CONTEXT_MAX_TOKENS = 1500
@@ -61,6 +63,7 @@ class _Range:
 
     def __init__(self, v: DocView, addr: str):
         r = resolve(v, addr)
+        self.resolved = r
         self.note = r.note
         self.segs = [s for s in r.segments if v.visible(s.block, s.page) or s.block.in_picture]
         self.refs = {s.block.ref for s in self.segs}
@@ -83,9 +86,15 @@ def _path(v: DocView, rg: _Range) -> list[str]:
         chain.append(sid)
         sid = v.sections[sid].get("parent")
     tables = _table_parts(v, rg)
+    guarded(_trace_path, v, rg, chain)
     if not chain:
         return ["path: (no section)"] + tables
     return ["path: " + " > ".join(f"{s} {v.section_label(s)}" for s in reversed(chain))] + tables
+
+
+def _trace_path(v: DocView, rg: _Range, chain: list[str]) -> None:
+    parts = {tuple(v.table_parts(s.block.ref)) for s in rg.segs if s.block.kind == "table"}
+    report(record.sig, "struct", part="path", units=list(reversed(chain)) + [short_ref(r) for p in parts if len(p) > 1 for r in p])
 
 
 def _table_parts(v: DocView, rg: _Range) -> list[str]:
@@ -108,6 +117,7 @@ def _parent(v: DocView, rg: _Range) -> list[str]:
     lead = lead[:LEAD_PARAGRAPHS]
     if not lead:
         return [f"parent {parent} has no text before its first subsection"]
+    report(record.out, pages=sorted({b.page for b in lead}), refs=[short_ref(b.ref) for b in lead])
     return [f"parent {parent} opens ({v.page_tag(lead[0].page)}):"] + [f'  "{_words(v.display(b.text), LEAD_WORDS)}"' for b in lead]
 
 
@@ -122,6 +132,7 @@ def _listing(v: DocView, title: str, sids: list[str], here: str | None, cap: int
         shown = sids[:cap]
     lines = [f"{title} ({len(sids)}):"]
     lines += [f"  {'◀ ' if s == here else ''}{_sec_line(v, s)}" for s in shown]
+    report(record.sig, "struct", part=title, units=shown, n=len(sids))
     if len(shown) < len(sids):
         lines.append(f"  … +{len(sids) - len(shown)} more (outline(section=…))")
     return lines
@@ -149,7 +160,7 @@ def _target(v: DocView, t: dict[str, Any]) -> str:
 
 def _refs_out(v: DocView, rg: _Range) -> list[str]:
     """References from the range first, then from the rest of its scope (tagged with their source)."""
-    seen, lines = set(), []
+    seen, lines, units = set(), [], []
     refs = (v.side.xrefs or {}).get("refs", [])
     ordered = [r for r in refs if r["src_ref"] in rg.refs] + [r for r in refs if r["src_ref"] in rg.scope - rg.refs]
     for r in ordered:
@@ -164,8 +175,10 @@ def _refs_out(v: DocView, rg: _Range) -> list[str]:
             dest = "? unresolved"
         src = "" if r["src_ref"] in rg.refs else f" (from {short_ref(r['src_ref'])})"
         lines.append(f'  {r["kind"]} "{r["span"]}" → {dest}{src}')
+        units.append([u for t in r["targets"][:2] for u in _units(v, t)] if r["status"] == "resolved" and r["targets"] else [])
     if not lines:
         return []
+    report(record.sig, "struct", part="refs_out", units=list(dict.fromkeys(u for us in units[:REFS_OUT] for u in us)), n=len(lines))
     out = [f"refs out ({len(lines)}):"] + lines[:REFS_OUT]
     return out + ([f"  … +{len(lines) - REFS_OUT} more"] if len(lines) > REFS_OUT else [])
 
@@ -178,11 +191,14 @@ def _refs_in(v: DocView, rg: _Range) -> list[str]:
     if not hits:
         return []
     lines = [f"refs in ({len(hits)}):"]
+    units: list[str] = []  # for the trace: the block and section each line shows
     for r in hits[:REFS_IN]:
         src = v.doc.by_ref.get(r["src_ref"])
         sid = v.section_of(src) if src else None
         snippet = _words(v.display(r["context"].strip("…")), SNIPPET_WORDS)
         lines.append(f'  {short_ref(r["src_ref"])} {v.page_tag(r["src_page"])}{" " + sid if sid else ""}: "{snippet}"')
+        units += [short_ref(r["src_ref"])] + ([sid] if sid else [])
+    report(record.sig, "struct", part="refs_in", units=list(dict.fromkeys(units)), n=len(hits))
     return lines + ([f"  … +{len(hits) - REFS_IN} more"] if len(hits) > REFS_IN else [])
 
 
@@ -221,7 +237,22 @@ def _footnotes(v: DocView, rg: _Range) -> list[str]:
             if b.label == "footnote" and b.layer == "body" and b.ref not in notes and b.ref not in rg.refs:
                 notes[b.ref] = f'  {short_ref(b.ref)} {v.page_tag(b.page)}: "{_words(v.display(b.text), 40)}"'
     lines = list(notes.values())
+    if lines:
+        shown = [v.doc.by_ref[ref] for ref in list(notes)[:FOOTNOTES]]
+        report(record.out, pages=sorted({b.page for b in shown if b.page}), refs=[short_ref(b.ref) for b in shown])
     return [f"footnotes ({len(lines)}):"] + lines[:FOOTNOTES] if lines else []
+
+
+def _units(v: DocView, t: dict[str, Any]) -> list[str]:
+    """The addresses a reference target's line shows (_target) that a trace can match: its block and the block's
+    section, else its page; none for another document."""
+    if t.get("doc") not in (None, v.name):
+        return []
+    block = v.doc.by_ref.get(t["ref"]) if t.get("ref") else None
+    if block is not None:
+        sid = v.section_of(block)
+        return [short_ref(block.ref)] + ([sid] if sid else [])
+    return [f"p{t['page']}"] if t.get("page") else []
 
 
 _BUILDERS: dict[str, Callable[[DocView, _Range], list[str]]] = {
@@ -234,6 +265,9 @@ def context(doc: str | DocView, addr: str, max_tokens: int = CONTEXT_MAX_TOKENS,
     """Section path, parent opening, siblings, children, refs out/in, terms and footnotes of a range."""
     v = _view(doc)
     rg = _Range(v, addr)
+    r = rg.resolved
+    report(record.addr, addr, kind=r.kind, pages=rg.pages, **({"err": r.note.removeprefix(f"{r.addr}: ")[:200]} if r.note and not r.segments else {}),
+                **({"cands": r.cands} if r.cands else {}))
     if not rg.segs:
         return f"[note] {rg.note or f'{addr}: nothing to show'}"
     span = v.page_range_tag(rg.pages[0], rg.pages[-1])
@@ -247,12 +281,15 @@ def context(doc: str | DocView, addr: str, max_tokens: int = CONTEXT_MAX_TOKENS,
     for name in PARTS[start:]:
         if start and name == "path":
             continue
+        mark = record.mark()
         chunk = _BUILDERS[name](v, rg)
         if not chunk:
             continue
         cost = count_tokens("\n".join(chunk))
         if used + cost > max_tokens and len(lines) > 1:
+            record.rewind(mark)  # this part is not shown
             lines.append(f"next: part={name}")
+            report(record.sig, "next", rest=[f"part={name}"], why="budget")
             break
         lines += chunk
         used += cost

@@ -12,8 +12,9 @@ import re
 from functools import lru_cache
 
 from tglw.common import registry
+from tglw.trace import record
 
-from . import switches
+from . import switches, tracing
 
 PAGE_MARK = " · scanned, OCR text"
 _HEADER = re.compile(r"^== p(\d+)\b(.*?) ==$", re.M)
@@ -41,20 +42,27 @@ def mark_read(name: str, text: str) -> str:
     by note_line. Unchanged otherwise."""
     if not switches.on("OCR_NOTE"):
         return text
-    first = True
+    marked: list[int] = []
 
     def mark(m: re.Match[str]) -> str:
-        nonlocal first
         page = int(m.group(1))
         if not scanned(name, page):
             return m.group(0)
         line = f"== p{page}{m.group(2)}{PAGE_MARK} =="
-        if first:
-            first = False
+        if not marked:
             line += "\n" + note_line(page)
+        marked.append(page)
         return line
 
-    return _HEADER.sub(mark, text)
+    out = _HEADER.sub(mark, text)
+    if marked:
+        tracing.guarded(_report_scan, text, out, marked)
+    return out
+
+
+def _report_scan(text: str, out: str, marked: list[int]) -> None:
+    record.sig("scan", pages=marked)
+    record.dec("scan_notes", src=switches.env_name("OCR_NOTE"), pages=marked, tokens=tracing.added(text, out))
 
 
 def region_text_header(name: str, page: int, layer: bool) -> str:

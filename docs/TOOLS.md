@@ -168,7 +168,7 @@ The `TGLW_` prefix of most switches, like the import package name `tglw` in `pyt
 
 ### On by default
 
-With all of these off and `TGLW_MCP_LIMITS=off`, the tool output on the documents we tested is byte-for-byte that of the version we tested (checked by replaying 1,826 recorded tool calls).
+With all of these off, `TGLW_MCP_LIMITS=off` and `TGLW_RULES=0`, the tool output on the documents we tested is byte-for-byte that of the version we tested (checked by replaying 1,826 recorded tool calls).
 
 | Variable | Effect |
 |---|---|
@@ -192,7 +192,7 @@ With all of these off and `TGLW_MCP_LIMITS=off`, the tool output on the document
 | `TGLW_SEARCH_FOLD` † | Chinese and literal search treat traditional and simplified characters as the same; text is still shown as printed |
 | `TGLW_VIS_ADAPTIVE_ZOOM` † | `region` picks the picture scale from the smallest text in it (1.5 to 3 times). It also lets every picture be up to 1,568 pixels on the long side instead of 1,200, with the same area limit, so pictures can be larger even when the model sets the scale itself. In a replay of recorded calls, picture tokens rose by about 12% |
 
-The switches without † only add information, or turn an address that used to fail into its content. The switches marked † change what the model is shown, and were switched on only after a check. The six text switches were checked on 65 development questions: with Haiku, this release scored 97.2% against 97.1% for the version we tested, at 0.92 of the cost, and passed all five no-regression rules fixed in advance. The picture scale was checked on 15 development questions that need a figure, where it did no worse than the fixed scale. The three Chinese switches, which act only on Chinese documents, were checked on 15 Chinese development questions; see [Results](RESULTS.md#chinese-experimental). Each question was run once and Haiku's reading of figures varies a lot, so we read both checks as no loss, not as an improvement; see [Results](RESULTS.md#this-release-and-the-tested-version).
+The switches without † only add information, or turn an address that used to fail into its content. The switches marked † change what the model is shown, and were switched on only after a check. The six text switches were checked on 65 development questions: with Haiku, 0.1.0 scored 97.2% against 97.1% for the version we tested, at 0.92 of the cost, and passed all five no-regression rules fixed in advance. The picture scale was checked on 15 development questions that need a figure, where it did no worse than the fixed scale. The three Chinese switches, which act only on Chinese documents, were checked on 15 Chinese development questions; see [Results](RESULTS.md#chinese-experimental). Each question was run once and Haiku's reading of figures varies a lot, so we read both checks as no loss, not as an improvement; see [Results](RESULTS.md#010-and-the-tested-version).
 
 The `TGLW_SRC_BOX_FIX`, `TGLW_SRC_DUP_BLOCKS` and `TGLW_SRC_ROTATED_PAGES` switches repair parses made with an older Docling setup. They work only in a library that has the matching repair files, which `vestigium ingest` does not create, so in your own library they have no effect. Documents added with `vestigium ingest` rarely need them anyway: when 6 documents were converted again with the current setup, wrongly placed boxes fell from 574 to 3 and duplicate blocks from 424 to 0.
 
@@ -206,12 +206,26 @@ These change what the model is told or shown. They stay off until a trial shows 
 | `TGLW_READ_DOC_ADDR` | `read`, `context` and `region` accept `document:address` |
 | `TGLW_SEARCH_LIST` | `search(mode="list", offset=N)` lists every match as addresses |
 | `TGLW_MCP_ANSWER_HINT` | The server's instructions ask the model to answer item by item, with a page for each. In a trial on 21 development questions it did not improve accuracy |
-| `TGLW_SRC_RUNNING_HEADERS` | Hides running page headers that the parser mistook for headings, and stops them from splitting sections. After turning it on, rebuild the library index with the same setting: `python -m tglw.corpus build` |
+| `TGLW_SRC_RUNNING_HEADERS` | Hides running page headers that the parser mistook for headings, and stops them from splitting sections. After turning it on, rebuild the library index with the same setting: `TGLW_SRC_RUNNING_HEADERS=1 python -m tglw.corpus build`. Reading a single document follows the switch as soon as the server starts; that needs no rebuild |
 | `TGLW_VIS_TOKEN_NOTE` | Tool descriptions give the approximate token cost of a picture instead of saying pictures are costly. In a trial on 15 figure questions it did not improve accuracy |
 | `TGLW_VIS_FIG_LABELS` | Shortens long lists of labels inside figures (can drop information) |
 | `TGLW_CJK` | Every document, not just Chinese ones, uses Chinese search (the older switch) |
 
 Chinese support is experimental; see [Results](RESULTS.md#chinese-experimental).
+
+### Traces and rules
+
+These control the record of readings ([Traces](TRACES.md)) and the rules ([Rules](RULES.md)).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TGLW_TRACE` | on | Record every tool call on this machine. `0`: record nothing |
+| `TGLW_TRACE_TOOL` | off | Adds a seventh tool, `trace`, so your agent can read the record |
+| `TGLW_TRACE_QUERY` | on | Store your agent's search words in the record. `0`: store only their length and a hash (except in the entries of the optional `add absence` and `add coverage` rules; see [Traces](TRACES.md#what-is-stored-and-where)) |
+| `TGLW_TRACE_MAX_MB` | 100 | Size cap for all traces together; the oldest are deleted first |
+| `TGLW_RULES_TOOL` | off | Adds the `rules` tool, so your agent can see and change rules |
+| `TGLW_RULES` | on | Let the rules in effect act. `0`: no rule acts, and replies are as without rules (for evaluations) |
+| `TGLW_RULES_RECOMMENDED` | on | Include the recommended rules. `0`: leave them out (for evaluations) |
 
 ### Command-line options of `vestigium mcp --http`
 

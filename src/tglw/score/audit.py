@@ -27,7 +27,7 @@ from pathlib import Path
 from tglw.common import paths, registry
 
 from . import settings
-from .plan import ALLOWED_DOCS_ENV
+from .plan import ALLOWED_DOCS_ENV, ONLY_TOOL
 
 ALWAYS = {"WebSearch", "WebFetch", "Agent", "Task", "Workflow", "Skill"}
 T_NATIVE_OK = {"TodoWrite", "ToolSearch"}
@@ -176,6 +176,9 @@ def audit(path: Path, condition: str, run_dir: Path, docs: Sequence[str] = ()) -
             elif docs and c.tool.startswith("mcp__tgl__") and (doc := _input(c).get("doc")) is not None \
                     and (other := _other_document(str(doc), docs, served)):
                 flag(f"document not named in the prompt: {other}")
+        elif condition in ONLY_TOOL:
+            if c.tool != f"mcp__tgl__{ONLY_TOOL[condition]}" and c.tool not in T_NATIVE_OK and c.tool not in ALWAYS:
+                flag(f"not the {ONLY_TOOL[condition]} tool in condition {condition}")
         elif c.tool.startswith("mcp__"):
             flag(f"MCP tool in condition {condition}")
         bad = [f for f in FORBIDDEN if f in args]

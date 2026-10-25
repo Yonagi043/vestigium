@@ -48,3 +48,4 @@ include = ["tglw*"]
 
 [tool.setuptools.package-data]
 "tglw.samples" = ["*.pdf", "*.bundle/*"]
+"tglw.store" = ["recommended.json"]

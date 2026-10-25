@@ -28,7 +28,7 @@ Either way, with Haiku Vestigium answered in about half the time of the whole-te
 
 ### Does it send my documents anywhere?
 
-Vestigium itself runs on your machine. Parsing, indexing and serving are all local, and the server talks to your agent app on the same machine. But the passages your agent reads are sent to whatever model the agent uses, the same as if you pasted them in. If a document must not leave your machine, use a local model. The optional HTTP server has no login: keep it on 127.0.0.1, its default (see [Agent apps](CLIENTS.md)).
+Vestigium itself runs on your machine. Parsing, indexing and serving are all local, and the server talks to your agent app on the same machine. But the passages your agent reads are sent to whatever model the agent uses, the same as if you pasted them in. If a document must not leave your machine, use a local model. The optional HTTP server has no login: keep it on 127.0.0.1, its default (see [Agent apps](CLIENTS.md)). The record of how documents were read, and the rules your agent writes, also stay on your machine. The record keeps no document passages, but it does keep your agent's search words, which can quote a phrase from a document; see [Traces](TRACES.md#what-is-stored-and-where) and [Rules](RULES.md#what-is-stored-and-where).
 
 ### Does it use a language model to build the index?
 

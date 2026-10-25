@@ -42,6 +42,8 @@ from . import settings
 from .questions import Question
 
 CONDITIONS = ("T", "P", "W", "V", "S")
+RUN_CONDITIONS = CONDITIONS + ("R", "U")  # staged by their own scripts, not planned from questions
+ONLY_TOOL = {"R": "trace", "U": "rules"}  # the one tgl tool of R (trace questions) and U (rule writing)
 DEFAULT_CONDITIONS = ("T", "P", "W")
 FULLTEXT = {"W": DATA / "K" / "fulltext", "V": DATA / "W2" / "fulltext"}
 PLAN_COLUMNS = ("order", "run_id", "stage", "condition", "question_id", "split", "doc", "material", "other_docs")
@@ -54,6 +56,13 @@ LAUNCH = {
     "W": 'claude --permission-mode default --strict-mcp-config --tools "Read,Grep,Glob"',
     "V": 'claude --permission-mode default --strict-mcp-config --tools "Read,Grep,Glob"',
     "S": 'claude --permission-mode default --strict-mcp-config --tools "Read,Grep,Glob"',
+    "R": 'claude --permission-mode default --strict-mcp-config --mcp-config .mcp.json --tools "" '
+         '--allowedTools mcp__tgl__trace --disallowedTools '
+         'mcp__tgl__list_documents,mcp__tgl__outline,mcp__tgl__read,mcp__tgl__context,mcp__tgl__search,mcp__tgl__region',
+    "U": 'claude --permission-mode default --strict-mcp-config --mcp-config .mcp.json --tools "" '
+         '--allowedTools mcp__tgl__rules --disallowedTools '
+         'mcp__tgl__list_documents,mcp__tgl__outline,mcp__tgl__read,mcp__tgl__context,mcp__tgl__search,mcp__tgl__region,'
+         'mcp__tgl__trace',
 }
 # Claude Code 2.1.283 auto-connects to an IDE when CLAUDE_CODE_SSE_PORT is set, when it detects a
 # VS Code or JetBrains terminal (TERM_PROGRAM, FORCE_CODE_TERMINAL), or when autoConnectIde is on;
@@ -93,7 +102,7 @@ SETTINGS_VARS = ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_MODEL", "ANTHROPIC_DEFAUL
 
 
 def launch_script(run_id: str, condition: str, run: Path, prompt_file: Path) -> str:
-    mcp = "only tgl" if condition == "T" else "no server"
+    mcp = "only tgl" if condition in ("T", *ONLY_TOOL) else "no server"
     qid = parse_run_id(run_id)[1]
     return LAUNCH_SCRIPT.format(run_id=run_id, cond=condition, qid=qid, prompt_file=prompt_file,
                                 run=shlex.quote(str(run)), mcp=mcp, launch=LAUNCH[condition],
@@ -302,9 +311,10 @@ def check_materials(rows: Sequence[dict[str, str]]) -> list[str]:
 
 
 def run_files(row: dict[str, str]) -> list[str]:
-    """What a staged run directory holds: .mcp.json (T), doc/ (S), <document>.pdf (P) or <document>.txt (W, V)."""
+    """What a staged run directory holds: .mcp.json (T, R and U), doc/ (S),
+    <document>.pdf (P) or <document>.txt (W, V)."""
     cond = row["condition"]
-    if cond == "T":
+    if cond in ("T", *ONLY_TOOL):
         return [".mcp.json"]
     if cond == "S":
         return ["doc"]
@@ -349,14 +359,16 @@ def stage(rows: Sequence[dict[str, str]], questions: dict[str, Question], dest: 
 def parse_run_id(rid: str) -> tuple[str, str, int]:
     cond, rest = rid.split("-", 1)
     qid, attempt = rest.rsplit("-", 1)
-    if cond not in CONDITIONS or not attempt.isdigit():
+    if cond not in RUN_CONDITIONS or not attempt.isdigit():
         raise ValueError(f"not a run id: {rid!r}")
     return cond, qid, int(attempt)
 
 
 def retry(dest: Path, rid: str) -> Path:
     """Stage the next attempt of a run: a new run directory with copies of the first attempt's files
-    (material, or .mcp.json with the same snapshot), the same prompt, and a fresh launch script."""
+    (material, or .mcp.json with the same snapshot), the same prompt, and a fresh launch script. A
+    server setting naming a directory of the run's own (e.g. the rules and trace directories, named
+    after the run id) gets one named after the new attempt, created empty where the first one exists."""
     cond, qid, _ = parse_run_id(rid)
     runs = dest / "runs"
     tries = sorted(parse_run_id(p.name)[2] for p in runs.glob(f"{cond}-{qid}-*") if p.is_dir())
@@ -366,6 +378,17 @@ def retry(dest: Path, rid: str) -> Path:
     new_id = run_id(cond, qid, tries[-1] + 1)
     new = runs / new_id
     shutil.copytree(first, new)
+    cfg = new / ".mcp.json"
+    if cfg.is_file():
+        d = json.loads(cfg.read_text())
+        for server in (d.get("mcpServers") or {}).values():
+            env = server.get("env") or {}
+            for k, v in env.items():
+                if isinstance(v, str) and Path(v).is_absolute() and Path(v).name == first.name:
+                    env[k] = str(Path(v).with_name(new_id))
+                    if Path(v).is_dir():
+                        Path(env[k]).mkdir(mode=0o700)
+        cfg.write_text(json.dumps(d, indent=2) + "\n")
     shutil.copyfile(dest / "prompts" / f"{first.name}.txt", dest / "prompts" / f"{new_id}.txt")
     write_launch([{"run_id": new_id, "condition": cond}], dest)
     return new

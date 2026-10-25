@@ -8,6 +8,7 @@ from collections import Counter
 from typing import Any
 
 from tglw.common import bundle
+from tglw.tables.empty import mark_empty
 from tglw.tables.fix import apply_moves
 from tglw.common.bundle import Block
 
@@ -65,6 +66,7 @@ def table_rows(view: DocView, b: Block) -> list[list[str]]:
 def render_table(view: DocView, b: Block) -> str:
     t = view.tables.get(b.ref) or {}
     grid = table_rows(view, b)
+    marked = mark_empty(grid, view.doc.item(b.ref)) if V1["empty_cells"] else grid  # the head and legend keep grid
     head = f"[{short_ref(b.ref)} {len(grid)}×{max((len(r) for r in grid), default=0)}"
     if t.get("continues"):
         head += f" cont. of {short_ref(t['continues'])}"
@@ -80,7 +82,7 @@ def render_table(view: DocView, b: Block) -> str:
         lines.append("cols: " + " | ".join(legend))
     skip = header_rows | set(t.get("repeated_header_rows") or [])
     restored = {int(k): v for k, v in (t.get("restored_labels") or {}).items()}
-    for i, row in enumerate(grid):
+    for i, row in enumerate(marked):
         if i in skip:
             continue
         cells = [_cell(c) for c in row]
@@ -95,6 +97,24 @@ def render_table(view: DocView, b: Block) -> str:
     if t.get("continued_by"):
         lines.append(f"[continues in {short_ref(t['continued_by'])}]")
     return "\n".join(lines)
+
+
+def table_notes(view: DocView, b: Block) -> dict[str, str]:
+    """The notes render_table adds to a table, by kind, as it adds them (for reading traces): the part it continues,
+    a scanned table, D2's column and (TABLE_NOTES) row notes, the part that continues it."""
+    t = view.tables.get(b.ref) or {}
+    out = {}
+    if t.get("continues"):
+        out["cont"] = f" cont. of {short_ref(t['continues'])}"
+    if any(f["kind"] == "scanned" for f in t.get("flags", [])):
+        out["scanned"] = " · scanned table; check image"
+    if t.get("col_note"):
+        out["col"] = f" · {t['col_note']}"
+    if V1["table_notes"] and t.get("row_note"):
+        out["row"] = f" · {t['row_note']}"
+    if t.get("continued_by"):
+        out["continued_by"] = f"[continues in {short_ref(t['continued_by'])}]"
+    return out
 
 
 def render_picture(view: DocView, b: Block) -> str:
@@ -115,7 +135,7 @@ def render_segment(view: DocView, seg: Segment, refs: bool = False, heading_as: 
         text = f"{b.marker} {text}"  # the number Docling keeps apart, e.g. "(8)" of SI-4(8)
     if heading_as is not None:
         return f"## {heading_as} · {tag}{text}"
-    if b.is_heading:
+    if b.is_heading and not (V1["table_rows"] and b.ref in view.table_rows):
         return f"### {tag}{text}"
     if b.label == "list_item" and seg.page == b.page:
         marker = b.marker or ("" if _ENUM.match(text) else "-")

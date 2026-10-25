@@ -89,12 +89,27 @@ PASSAGE_WORDS = 60
 RUNNING_HEADERS_ENV = "TGLW_SRC_RUNNING_HEADERS"  # 1: page headers Docling put in the body (A v4) split passages only
 
 
+TABLE_ROWS_ENV = "TGLW_SRC_TABLE_ROWS"  # 1: rows of scanned tables Docling took for headings (task TR) are text
+
+
+def switched(env: str) -> bool:
+    return os.environ.get(env, "").strip().lower() in ("1", "true", "on", "yes")
+
+
 def running_headers(name: str) -> frozenset[str]:
     """Refs of page headers that Docling put in the body as headings (task A's running_headers), when
     TGLW_SRC_RUNNING_HEADERS is on; read when an index is built."""
-    if os.environ.get(RUNNING_HEADERS_ENV, "").strip().lower() not in ("1", "true", "on", "yes"):
+    if not switched(RUNNING_HEADERS_ENV):
         return frozenset()
     return frozenset((_sidecar("A", ".structure.json", name) or {}).get("running_headers") or [])
+
+
+def table_rows(name: str) -> frozenset[str]:
+    """Refs of scanned-table rows that Docling labelled headings (task TR's tablerows sidecar), when
+    TGLW_SRC_TABLE_ROWS is on; read when an index is built."""
+    if not switched(TABLE_ROWS_ENV):
+        return frozenset()
+    return frozenset((_sidecar("TR", ".tablerows.json", name) or {}).get("table_rows") or [])
 
 
 @dataclass
@@ -116,9 +131,11 @@ class Passage:
         return sorted({p for b in self.blocks for p in b.pages})
 
 
-def passages(blocks: list[Block], node_of, skip: frozenset[str] = frozenset()) -> list[Passage]:
+def passages(blocks: list[Block], node_of, skip: frozenset[str] = frozenset(),
+             rows: frozenset[str] = frozenset()) -> list[Passage]:
     """`skip`: running page headers; each ends the passage before it, joins none and is no heading, so
-    the topic it interrupts goes on under its own heading."""
+    the topic it interrupts goes on under its own heading. `rows`: table rows labelled headings, read as
+    text."""
     out: list[Passage] = []
     cur: list[Block] = []
     heading: str | None = None
@@ -135,9 +152,10 @@ def passages(blocks: list[Block], node_of, skip: frozenset[str] = frozenset()) -
             flush()
             continue
         new_node = cur and node_of(b) != node_of(cur[0])
-        if b.is_heading or new_node or words >= PASSAGE_WORDS or (b.kind == "table" and cur):
+        head = b.is_heading and b.ref not in rows
+        if head or new_node or words >= PASSAGE_WORDS or (b.kind == "table" and cur):
             flush()
-        if b.is_heading:
+        if head:
             heading = b.text.strip()
         cur.append(b)
         words += len(b.text.split())
@@ -155,7 +173,8 @@ def picture_of(doc: Doc, b: Block) -> str | None:
     return None
 
 
-def figure_passages(doc: Doc, node_of, skip: frozenset[str] = frozenset()) -> list[Passage]:
+def figure_passages(doc: Doc, node_of, skip: frozenset[str] = frozenset(),
+                    rows: frozenset[str] = frozenset()) -> list[Passage]:
     """One passage per picture: its caption and inner text (axis titles, labels, legends), addressed by
     the picture, as task M5's literal search does. Heading: the last body heading before the picture."""
     inner: dict[str, list[Block]] = {}
@@ -170,7 +189,7 @@ def figure_passages(doc: Doc, node_of, skip: frozenset[str] = frozenset()) -> li
             pic = picture_of(doc, b)
             if pic:
                 inner.setdefault(pic, []).append(b)
-        elif b.is_heading and b.ref not in skip:
+        elif b.is_heading and b.ref not in skip and b.ref not in rows:
             heading = b.text.strip()
     out = []
     for pic, blocks in inner.items():
@@ -191,6 +210,7 @@ class Index:
     blocks: list[Block]
     cache: dict[Any, Any] = field(default_factory=dict)
     running: frozenset[str] = frozenset()
+    rows: frozenset[str] = frozenset()
 
     @property
     def pages(self) -> list[int]:
@@ -215,8 +235,8 @@ class Index:
     def passages(self) -> list[Passage]:
         """Text passages, then one passage per picture with inner text."""
         if "passages" not in self.cache:
-            self.cache["passages"] = (passages(self.blocks, self.block_node, self.running)
-                                      + figure_passages(self.doc, self.block_node, self.running))
+            self.cache["passages"] = (passages(self.blocks, self.block_node, self.running, self.rows)
+                                      + figure_passages(self.doc, self.block_node, self.running, self.rows))
         return self.cache["passages"]
 
 
@@ -233,7 +253,7 @@ def build(doc: Doc) -> Index:
                 page_nodes[p][n] += len(t.split()) or 1
     blocks = [b for b in doc.blocks if b.layer == "body" and b.text and b.page is not None and not b.in_picture]
     return Index(doc, sections, page_labels(doc.name), expansions(doc.name), page_text, page_nodes, blocks,
-                 running=running_headers(doc.name))
+                 running=running_headers(doc.name), rows=table_rows(doc.name))
 
 
 @bundle.doc_cache

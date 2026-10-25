@@ -15,8 +15,9 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as raw
 
 from tglw.common import registry
+from tglw.trace import record
 
-from . import switches
+from . import switches, tracing
 from .ocr import scanned
 
 Box = tuple[float, float, float, float]  # l, t, r, b in PDF points, origin bottom-left (Docling's frame)
@@ -107,7 +108,21 @@ def default_scale(name: str, page: int, box: Box | None, base: float = BASE_SCAL
     crops, else base (whole pages always base)."""
     if not switches.on("ADAPTIVE_ZOOM") or box is None:
         return base
+    em = em_of(name, page, box)
+    scale = auto_scale(em, box)
+    tracing.guarded(_report_zoom, scale, em)
+    return scale
+
+
+def chosen_scale(name: str, page: int, box: Box | None, base: float = BASE_SCALE) -> float:
+    """default_scale without reporting it: what region would use when the caller gives no scale."""
+    if not switches.on("ADAPTIVE_ZOOM") or box is None:
+        return base
     return auto_scale(em_of(name, page, box), box)
+
+
+def _report_zoom(scale: float, em: float | None) -> None:
+    record.dec("auto_zoom", src=switches.env_name("ADAPTIVE_ZOOM"), scale=scale, em_pt=round(em, 2) if em else None)
 
 
 def max_side(base: int = NARROW_MAX_SIDE) -> int:

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 import re
-from collections import Counter
+import threading
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from rank_bm25 import BM25Okapi
 
@@ -17,11 +19,15 @@ from tglw.common.text import count_tokens, norm
 from tglw.figures import rank as figure_rank
 from tglw.pagemap.build import pdf_pages
 from tglw.structure.numbering import number_key
+from tglw.trace import record
 
 from . import sidecars
 from .docview import Block, DocView, Segment, long_ref, short_ref
-from .render import render_loss, render_segment, squeeze, table_rows
+from tglw.tables.empty import EMPTY, mark_empty
+
+from .render import render_loss, render_segment, squeeze, table_notes, table_rows
 from .switches import V1
+from .tracing import guarded, report
 
 READ_MAX_TOKENS = 8000
 OUTLINE_MAX_LINES = 60
@@ -83,9 +89,15 @@ def _view(doc: str | DocView) -> DocView:
 
 @dataclass
 class Resolved:
+    """kind, cands and grown are for reading traces: what the address was taken as (page, pages, section, block,
+    table, figure, printed, label, continue), the candidates its note names, and the (page, order) of the blocks
+    M6's page context added."""
     addr: str
     segments: list[Segment] = field(default_factory=list)
     note: str | None = None
+    kind: str = ""
+    cands: list[str] = field(default_factory=list)
+    grown: set[tuple[int, int]] = field(default_factory=set)
 
 
 def _alias_nodes(v: DocView, text: str) -> list[str]:
@@ -109,7 +121,11 @@ def resolve(v: DocView, addr: str, page_context: bool = False) -> Resolved:
     base, _, cursor = addr.strip().partition(" from ")
     r = _resolve_base(v, base.strip(), addr)
     if page_context and M6["page_context"] and r.segments and long_ref(base.strip()) is not None:
+        asked = {(s.page, s.block.order) for s in r.segments}
         r.segments = _page_context(v, r.segments)
+        r.grown = {(s.page, s.block.order) for s in r.segments} - asked
+    if cursor:
+        r.kind = "continue"
     if cursor and r.segments:
         keys = [v.place(s) for s in r.segments if short_ref(s.block.ref) == cursor.strip()]
         if keys:
@@ -132,7 +148,7 @@ def _page_context(v: DocView, segs: list[Segment]) -> list[Segment]:
 
 def _resolve_base(v: DocView, base: str, addr: str) -> Resolved:
     try:
-        return Resolved(addr, v.resolve(base))
+        return Resolved(addr, v.resolve(base), kind=_kind(base))
     except ValueError as err:
         error = str(err)
     m = _PRINTED.match(base)
@@ -140,30 +156,40 @@ def _resolve_base(v: DocView, base: str, addr: str) -> Resolved:
         label, ctx = m.group("label").strip(), m.group("ctx")
         pages = pdf_pages(v.side.pagemap, label, context=ctx)
         if len(pages) == 1:
-            return Resolved(addr, v.page_segments(pages[0]))
+            return Resolved(addr, v.page_segments(pages[0]), kind="printed")
         if not pages:
-            return Resolved(addr, note=f"{addr}: no page printed {label!r}" + (f" in {ctx!r}" if ctx else ""))
+            return Resolved(addr, note=f"{addr}: no page printed {label!r}" + (f" in {ctx!r}" if ctx else ""), kind="printed")
         runs = v.side.pagemap["runs"]
         run_of = {p["pdf_page"]: p.get("run") for p in v.side.pagemap["pages"]}
         opts = [f"p{p}" + (f" ({runs[run_of[p]]['run_context']['text']})"
                            if run_of[p] is not None and runs[run_of[p]].get("run_context", {}).get("text") else "")
                 for p in pages]
         return Resolved(addr, note=f"{addr}: printed {label!r} is on several pages: " + "; ".join(opts)
-                        + " — read one p<N>, or add @context")
+                        + " — read one p<N>, or add @context", kind="printed", cands=[f"p{p}" for p in pages])
     sids = _alias_nodes(v, base)
     if len(sids) == 1:
-        return Resolved(addr, v.resolve(sids[0]))
+        return Resolved(addr, v.resolve(sids[0]), kind="label")
     if sids:
         return Resolved(addr, note=f"{addr}: several sections match: "
-                        + "; ".join(f"{sid} {v.section_path(sid)}" for sid in sids[:8]))
+                        + "; ".join(f"{sid} {v.section_path(sid)}" for sid in sids[:8]), kind="label", cands=sids[:8])
     if V1["zh_addresses"] and _HAN_CHAR.search(base) and (sids := _zh_nodes(v, base)):
         if len(sids) == 1:
-            return Resolved(addr, v.resolve(sids[0]))
+            return Resolved(addr, v.resolve(sids[0]), kind="label")
         return Resolved(addr, note=f"{addr}: several sections match: "
-                        + "; ".join(f"{sid} {v.section_path(sid)}" for sid in sids[:8]))
+                        + "; ".join(f"{sid} {v.section_path(sid)}" for sid in sids[:8]), kind="label", cands=sids[:8])
     if V1["footnote_addresses"] and (m := _FOOTNOTE.match(base)):
         return _footnote(v, int(m.group(1)), addr)
     return Resolved(addr, note=f"{addr}: {error}; also not a printed page (P36, page:iii@context) or a section number")
+
+
+def _kind(base: str) -> str:
+    """The kind of an address DocView.resolve took (s12, p45, p45-47, t123, tab4, fig5, #/texts/123), for traces."""
+    if base.startswith("#/"):
+        return {"tables": "table", "pictures": "figure"}.get(base.split("/")[1], "block")
+    if base.startswith("p"):
+        return "pages" if "-" in base else "page"
+    return "section" if base.startswith("s") else "table" if base.startswith("tab") else \
+        "figure" if base.startswith("fig") else "block"
 
 
 def _zh_nodes(v: DocView, text: str) -> list[str]:
@@ -181,17 +207,21 @@ def _footnote(v: DocView, number: int, addr: str) -> Resolved:
     found = [b for b in v.doc.blocks if b.label == "footnote" and not b.in_picture and v.visible(b)
              and (m := _FOOTNOTE_NUMBER.match(b.text)) and int(m.group(1)) == number]
     if len(found) == 1:
-        return Resolved(addr, v.block_segments(found[0]))
+        return Resolved(addr, v.block_segments(found[0]), kind="label")
     if found:
         return Resolved(addr, note=f"{addr}: several footnotes numbered {number}: "
-                        + ", ".join(f"{short_ref(b.ref)} {v.page_tag(b.page)}" for b in found[:8]) + " — read one by id")
-    return Resolved(addr, note=f"{addr}: no footnote numbered {number}; search mode='literal' finds its text")
+                        + ", ".join(f"{short_ref(b.ref)} {v.page_tag(b.page)}" for b in found[:8]) + " — read one by id",
+                        kind="label", cands=[short_ref(b.ref) for b in found[:8]])
+    return Resolved(addr, note=f"{addr}: no footnote numbered {number}; search mode='literal' finds its text", kind="label")
 
 
 # ---- read -----------------------------------------------------------------------------------
 
-def _next(resolved: list[Resolved], left: list[tuple[int, tuple[int, int], Segment]]) -> str:
-    """Addresses that cover what was not delivered; a cut address resumes " from <block>"."""
+def _next(resolved: list[Resolved], left: list[tuple[int, tuple[int, int], Segment]], why: str = "budget",
+          v: DocView | None = None, last: Segment | None = None) -> str:
+    """Addresses that cover what was not delivered; a cut address resumes " from <block>". Traced with why (the
+    token budget or the character cap stopped the read) and, given the view and the last segment shown, the
+    sections of the first block left and of the last one shown (a rule's same-section)."""
     rest = []
     for i, r in enumerate(resolved):
         mine = [s for j, _, s in left if j == i]
@@ -201,6 +231,9 @@ def _next(resolved: list[Resolved], left: list[tuple[int, tuple[int, int], Segme
             rest.append(r.addr)
         else:
             rest.append(f"{r.addr.split(' from ')[0]} from {short_ref(mine[0].block.ref)}")
+    where = {"sec": v.section_of(left[0][2].block) if left else None,
+             "last_sec": v.section_of(last.block) if last is not None else None} if v is not None else {}
+    report(record.sig, "next", rest=rest, why=why, **where)
     return "next: " + ", ".join(rest)
 
 
@@ -241,17 +274,25 @@ def _term_notes(v: DocView, text: str, pages: set[int]) -> list[str]:
 
 
 def read(doc: str | DocView, addrs: list[str] | str, max_tokens: int = READ_MAX_TOKENS, refs: bool = False,
-         xrefs: bool = False, terms: bool = False, max_chars: int | None = None, grow: bool = True) -> str:
+         xrefs: bool = False, terms: bool = False, max_chars: int | None = None, grow: bool = True,
+         grown: str | None = None, page_context: bool = True) -> str:
     """Text of the addressed sections/pages/blocks in page order, with page and section marks.
 
     Stops at a block boundary once max_tokens (or max_chars) is passed and ends with a "next:" line
-    to continue."""
+    to continue. grown: the page M6 added to the addresses, which a reading trace counts as the tool's.
+    page_context=False: a block comes without the rest of its page (M6), as a rule reads on."""
     v = _view(doc)
     addrs = [addrs] if isinstance(addrs, str) else list(addrs)
+    mark = record.mark()
+    given, origin = list(addrs), []
     intent: list[str] = []
     if M8["intent_addresses"]:
-        addrs, intent = _intent(v, addrs, max_tokens)
-    resolved = [resolve(v, a, page_context=True) for a in addrs]
+        addrs, intent = _intent(v, addrs, max_tokens, origin)
+    else:
+        origin = list(range(len(addrs)))
+    resolved = [resolve(v, a, page_context=page_context) for a in addrs]
+    if grown is None:
+        guarded(_trace_addrs, given, origin, resolved)
     queue: list[tuple[int, tuple[int, int], Segment]] = []
     seen: set[tuple[int, int]] = set()
     for i, r in enumerate(resolved):
@@ -270,6 +311,7 @@ def read(doc: str | DocView, addrs: list[str] | str, max_tokens: int = READ_MAX_
     last: Segment | None = None
     shown_pages: set[int] = set()
     body: list[str] = []
+    shown: list[tuple[int, Segment, int]] = []  # what is delivered (address, segment, tokens), for traces
     loose, rebuilt = v.loose_tables if V1["loose_tables"] else ({}, set())
     for n, (i, key, seg) in enumerate(queue):
         b = seg.block
@@ -283,13 +325,15 @@ def read(doc: str | DocView, addrs: list[str] | str, max_tokens: int = READ_MAX_
             cost = count_tokens(text)
             if used + cost > max_tokens or (max_chars is not None and chars + len(text) > max_chars):
                 lines += body
-                lines.append(_next(resolved, queue[n:]))
+                lines.append(_next(resolved, queue[n:], "budget" if used + cost > max_tokens else "chars", v, last))
+                guarded(_trace_read, v, resolved, shown, grown)
                 return "\n".join(lines)
             body[-1] += text
             used += cost
             chars += len(text)
             page, last = None, seg  # the next block on this page gets its page mark
             shown_pages.add(seg.page)
+            shown.append((i, seg, cost))
             continue
         chunk = []
         if seg.page != page:
@@ -309,8 +353,8 @@ def read(doc: str | DocView, addrs: list[str] | str, max_tokens: int = READ_MAX_
         rendered = render_segment(v, seg, refs=refs, heading_as=heading_as)
         if table is not None:
             from tglw.tables.loose import render as render_loose
-            shown = not table["restored"] and v.visible(b, seg.page)
-            rendered = render_loose(table) + ("\n" + rendered if shown else "")
+            shown_too = not table["restored"] and v.visible(b, seg.page)
+            rendered = render_loose(table) + ("\n" + rendered if shown_too else "")
         if rendered.strip(" …") == "":
             continue
         chunk.append(rendered)
@@ -322,37 +366,104 @@ def read(doc: str | DocView, addrs: list[str] | str, max_tokens: int = READ_MAX_
         cost = count_tokens(text)
         if body and (used + cost > max_tokens or (max_chars is not None and chars + len(text) + 1 > max_chars)):
             lines += body
-            lines.append(_next(resolved, queue[n:]))
+            lines.append(_next(resolved, queue[n:], "budget" if used + cost > max_tokens else "chars", v, last))
+            guarded(_trace_read, v, resolved, shown, grown)
             return "\n".join(lines)
         body.append(text)
         used += cost
         chars += len(text) + 1
         page, section, last = seg.page, sid or section, seg
         shown_pages.add(seg.page)
+        shown.append((i, seg, cost))
     lines += body
     if M6["continues"] and last is not None and (more := _continues(v, last, shown_pages)):
+        nxt, sid = more
         if M6["next_page_small_reads"] and grow and len(shown_pages) <= 2 and \
                 (M6["next_page_small_reads"] != "blocks" or any(long_ref(a.split(" from ")[0].strip()) for a in addrs)):
-            return read(v, addrs + [more.split()[1]], max_tokens, refs, xrefs, terms, max_chars, grow=False)
-        lines.append(more)
+            record.rewind(mark, kinds=("sig", "dec", "out"))  # this pass is not what is delivered; its addresses are
+            return read(v, addrs + [f"p{nxt}"], max_tokens, refs, xrefs, terms, max_chars, grow=False, grown=f"p{nxt}",
+                        page_context=page_context)
+        lines.append(f"continues: p{nxt} ({sid})")
+        report(record.sig, "continues", page=nxt, sec=sid)
     if terms:
         notes = _term_notes(v, "\n".join(body), shown_pages)
         if notes:
             lines.append("terms: " + " · ".join(notes))
+    guarded(_trace_read, v, resolved, shown, grown)
     return "\n".join(lines)
 
 
-def _intent(v: DocView, addrs: list[str], budget: int = READ_MAX_TOKENS) -> tuple[list[str], list[str]]:
+def _trace_addrs(given: list[str], origin: list[int], resolved: list[Resolved]) -> None:
+    """Each address as the caller wrote it: what it was read as, its pages, or why it was not."""
+    if record.current() is None:
+        return
+    for j, r in zip(origin, resolved):
+        a = str(given[j]).strip()
+        fields: dict[str, object] = {"kind": r.kind, "pages": sorted({s.page for s in r.segments})}
+        if r.addr != a:
+            fields["as"] = r.addr
+        if r.note and not r.segments:
+            fields["err"] = r.note.removeprefix(f"{r.addr}: ")[:200]
+        if r.cands:
+            fields["cands"] = r.cands
+        report(record.addr, a, **fields)
+
+
+def _trace_read(v: DocView, resolved: list[Resolved], shown: list[tuple[int, Segment, int]], grown: str | None) -> None:
+    """What a read delivered -- pages, sections, tables and figures, blocks -- and which of it the tool added
+    without being asked: blocks of the same page (M6 page context), the next page (M6, `grown`), notes on tables."""
+    if record.current() is None or not shown:
+        return
+    asked = set().union(*({(s.page, s.block.order) for s in r.segments} - r.grown for r in resolved))
+    extra = set().union(*(r.grown for r in resolved)) - asked
+    added = len(resolved) - 1 if grown else None
+    units: list[str] = []
+    same, nxt = ([0, set()], [0, set()])
+    loose = v.loose_tables[0] if V1["loose_tables"] else {}
+    notes: dict[str, list[str]] = {}
+    note_tokens = 0
+    for i, seg, cost in shown:
+        b = seg.block
+        sid = v.section_of(b)
+        units += [sid] if sid and v.sections.get(sid, {}).get("kind") != "root" else []
+        units += [short_ref(b.ref)] if b.kind in ("table", "picture") else []
+        if i == added or (seg.page, b.order) in extra:
+            part = nxt if i == added else same
+            part[0] += cost
+            part[1].add(seg.page)
+        found = table_notes(v, b) if b.kind == "table" else {}
+        if (seg.page, b.ref) in loose:
+            from tglw.tables.loose import render as render_loose
+            found["rebuilt"] = render_loose(loose[(seg.page, b.ref)])
+        for kind, text in found.items():
+            if short_ref(b.ref) not in notes.setdefault(kind, []):
+                notes[kind].append(short_ref(b.ref))
+                note_tokens += count_tokens(text) if kind != "rebuilt" else 0  # a rebuilt table is the document's text
+    report(record.out, pages=sorted({seg.page for _, seg, _ in shown}), units=list(dict.fromkeys(units)),
+           refs=[short_ref(seg.block.ref) for _, seg, _ in shown])
+    if same[0]:
+        report(record.dec, "grow", src="M6.page_context", pages=sorted(same[1]), tokens=same[0])
+    if nxt[0]:
+        report(record.dec, "grow", src="M6.next_page_small_reads", pages=sorted(nxt[1]), tokens=nxt[0])
+    for kind, tabs in notes.items():
+        report(record.sig, "table_note", kind=kind, tabs=tabs)
+    if notes:
+        report(record.dec, "table_notes", src="D2", kinds=sorted(notes), tokens=note_tokens)
+
+
+def _intent(v: DocView, addrs: list[str], budget: int = READ_MAX_TOKENS,
+            origin: list[int] | None = None) -> tuple[list[str], list[str]]:
     """Addresses as meant (AGENT P1). An address that does not resolve as written is read leniently:
     several ids in one string are split, a section id followed by its number or title is the id, a
     region box is its page. A section named together with a page or block inside it (after its first
     page) is read from that page on, with a note, when its text before that page alone fills the
     budget -- a read of a page with its 56-page chapter re-read the chapter from its first page and was
     cut before the page after the one asked for; a short section is read whole (a three-page section named
-    with a figure on its last page)."""
+    with a figure on its last page). origin, when given, gets the index in addrs of each address returned."""
     out: list[str] = []
-    for a in addrs:
+    for j, a in enumerate(addrs):
         s = str(a).strip()
+        before = len(out)
         if _resolve_base(v, s.partition(" from ")[0].strip(), s).segments:
             out.append(s)
         elif _ID_LIST.match(s):
@@ -361,6 +472,8 @@ def _intent(v: DocView, addrs: list[str], budget: int = READ_MAX_TOKENS) -> tupl
             out.append(m.group(1))
         else:
             out.append(s)
+        if origin is not None:
+            origin += [j] * (len(out) - before)
     pages = sorted({seg.page for a in out if re.fullmatch(r"p\d+(?:-p?\d+)?|(?:t|tab|fig)\d+", a)
                     for seg in _resolve_base(v, a, a).segments})
     notes = []
@@ -388,9 +501,9 @@ def _fills(v: DocView, sid: str, page: int, budget: int) -> bool:
     return False
 
 
-def _continues(v: DocView, last: Segment, shown: set[int]) -> str | None:
-    """"continues: p151 (s17)" when the section of the last block shown goes on past the last page
-    shown (a read of three blocks stopped at a page end; what it needed was on the next page)."""
+def _continues(v: DocView, last: Segment, shown: set[int]) -> tuple[int, str] | None:
+    """(151, "s17") for "continues: p151 (s17)" when the section of the last block shown goes on past the last
+    page shown (a read of three blocks stopped at a page end; what it needed was on the next page)."""
     sid = v.section_of(last.block)
     if not sid or v.sections.get(sid, {}).get("kind") == "root":
         return None
@@ -398,7 +511,7 @@ def _continues(v: DocView, last: Segment, shown: set[int]) -> str | None:
     nxt = max(shown) + 1
     if not span or span[1] < nxt:
         return None
-    return f"continues: p{nxt} ({sid})"
+    return nxt, sid
 
 
 def _contents(v: DocView, resolved: list[Resolved], queue: list[tuple[int, tuple[int, int], Segment]],
@@ -413,6 +526,7 @@ def _contents(v: DocView, resolved: list[Resolved], queue: list[tuple[int, tuple
         return None
     out = [f"[note] {len(resolved)} addresses, about {_tok(total)} tokens: too long for one read. "
            "Contents first, then as much as fits; read the others by address."]
+    report(record.sig, "too_long", n_addrs=len(resolved), tokens=total)
     for r in resolved:
         if not r.segments:
             continue
@@ -456,13 +570,14 @@ def _header(v: DocView) -> str:
             + f" · {_tok(total)} tokens · structure {status} · sidecars: {vers}")
 
 
-def _section_lines(v: DocView, root: str, depth: int) -> list[tuple[int, str]]:
+def _section_lines(v: DocView, root: str, depth: int) -> list[tuple[int, str, str]]:
+    """(level below root, line, section id) per section shown."""
     tokens = _block_tokens(v.name)
     base = v.sections[root]["depth"]
     kids: dict[str, list[str]] = {}
     for sid, n in v.sections.items():
         kids.setdefault(n.get("parent"), []).append(sid)
-    out: list[tuple[int, str]] = []
+    out: list[tuple[int, str, str]] = []
     unsure = (v.side.structure or {}).get("verdict", {}).get("status") != "reliable"
 
     def walk(sid: str) -> None:
@@ -475,7 +590,7 @@ def _section_lines(v: DocView, root: str, depth: int) -> list[tuple[int, str]]:
             tok = sum(tokens[n["start_order"]:n["end_order"]])
             pages = v.section_pages(c)
             where = v.page_range_tag(*pages) if pages else "no pages"
-            out.append((rel, f"{'  ' * (rel - 1)}{c} {v.section_label(c)}{flag} · {where} · {_tok(tok)}{more}"))
+            out.append((rel, f"{'  ' * (rel - 1)}{c} {v.section_label(c)}{flag} · {where} · {_tok(tok)}{more}", c))
             if rel < depth:
                 walk(c)
 
@@ -508,25 +623,31 @@ def outline(doc: str | DocView, depth: int = 2, section: str | None = None, max_
     if v.sections and (status in ("reliable", "partial") or section):
         root = section or next(sid for sid, n in v.sections.items() if n["kind"] == "root")
         if root not in v.sections:
+            report(record.sig, "struct", part="outline", units=[], root=root, err="no such section")
             return lines[0] + f"\n[note] no section {root!r}"
         rows = _section_lines(v, root, depth)
         while len(rows) > max_lines and depth > 1:
             depth -= 1
             rows = _section_lines(v, root, depth)
-        lines += [r for _, r in rows[:max_lines]]
+        lines += [r for _, r, _ in rows[:max_lines]]
         if len(rows) > max_lines:
             lines.append(f"… +{len(rows) - max_lines} more; use outline(section=…) or read by page")
         if status == "partial":
             lines.append("[note] structure partial: [level?] marks sections whose level is not certain")
+        report(record.sig, "struct", part="outline", units=[sid for _, _, sid in rows[:max_lines]], reliable=status, depth=depth,
+                   more=max(0, len(rows) - max_lines), **({"root": section} if section else {}))
         return "\n".join(lines)
     toc = _toc_lines(v)
     if toc:
         lines.append("[note] section levels unknown; entries below are the printed table of contents (read by page)")
         lines += toc[:max_lines] + ([f"… +{len(toc) - max_lines} more"] if len(toc) > max_lines else [])
+        report(record.sig, "struct", part="toc", units=[], reliable=status, n=min(len(toc), max_lines), more=max(0, len(toc) - max_lines))
         return "\n".join(lines)
     heads = [f"{v.display(b.text)[:80]} · {v.page_tag(b.page)}" for b in v.doc.headings() if v.visible(b)]
     lines.append("[note] section levels unknown; headings in reading order (read by page)")
     lines += heads[:max_lines] + ([f"… +{len(heads) - max_lines} more"] if len(heads) > max_lines else [])
+    report(record.sig, "struct", part="headings", units=[], reliable=status, n=min(len(heads), max_lines),
+               more=max(0, len(heads) - max_lines))
     return "\n".join(lines)
 
 
@@ -606,6 +727,48 @@ def _sentences(text: str) -> list[str]:
     return [x for x in out if x.strip()]
 
 
+EMPTY_WINDOW = True  # with empty_cells: excerpts are sized without the "·" marks (switchable for replays)
+
+
+def _counted(words: list[str]) -> list[int]:
+    """The words an excerpt's size counts: all; with empty_cells (and EMPTY_WINDOW) not what the empty-cell marks
+    add -- each mark, and the "|" before marks that end a row (a row without marks drops its empty last cells) -- so
+    an excerpt holds the same text as without them."""
+    if not (V1["empty_cells"] and EMPTY_WINDOW):
+        return list(range(len(words)))
+    skip: set[int] = set()
+    k = 0
+    while k < len(words):
+        if words[k] == "|" and k + 1 < len(words) and words[k + 1] == EMPTY:
+            j = k
+            while j + 1 < len(words) and words[j] == "|" and words[j + 1] == EMPTY:
+                j += 2
+            ends_row = not (j < len(words) and words[j] == "|")
+            skip.update(m for m in range(k, j) if ends_row or words[m] == EMPTY)
+            k = j
+        else:
+            if words[k] == EMPTY:
+                skip.add(k)
+            k += 1
+    return [k for k in range(len(words)) if k not in skip]
+
+
+def _size(text: str) -> int:
+    spans = _spans(text)
+    if not (V1["empty_cells"] and EMPTY_WINDOW):
+        return len(spans)
+    return len(_counted([text[x:y] for x, y in spans]))
+
+
+def _cut_window(words: list[str], hit: list[bool]) -> tuple[int, int]:
+    """_window over the counted words, as a slice of all the words."""
+    real = _counted(words)
+    if len(real) == len(words):
+        return _window(words, hit)
+    a, b = _window([words[k] for k in real], [hit[k] for k in real])
+    return real[a], real[b - 1] + 1
+
+
 def _window(words: list[str], hit: list[bool]) -> tuple[int, int]:
     """EXCERPT_MAX_WORDS words with the most hits; of equal windows the middle one."""
     n = EXCERPT_MAX_WORDS
@@ -620,7 +783,8 @@ def _pieces(v: DocView, seg: Segment) -> list[str]:
     """What an excerpt is cut from: a table's rows (cells joined by |), else the sentences."""
     if seg.block.kind == "table":
         rows = []
-        for row in table_rows(v, seg.block):
+        grid = table_rows(v, seg.block)
+        for row in mark_empty(grid, v.doc.item(seg.block.ref)) if V1["empty_cells"] else grid:
             cells = [" ".join(x.split()) for x in row]
             while cells and not cells[-1]:
                 cells.pop()
@@ -645,7 +809,7 @@ def _excerpt_from(pieces: list[str], pick: Callable[[str], tuple], i: int | None
     lo, hi = i, i + 1
 
     def size(a: int, b: int) -> int:
-        return len(_spans(" ".join(pieces[a:b])))
+        return _size(" ".join(pieces[a:b]))
 
     while True:
         short = size(lo, hi) < EXCERPT_MIN_WORDS
@@ -660,12 +824,12 @@ def _excerpt_from(pieces: list[str], pick: Callable[[str], tuple], i: int | None
     words = [text[x:y] for x, y in spans]
     head, tail = lo > 0, hi < len(pieces)
     a, b = 0, len(words)
-    if len(words) > EXCERPT_MAX_WORDS:
+    if len(_counted(words)) > EXCERPT_MAX_WORDS:
         if _DOC_CJK.get()[2]:  # a phrase of several characters (literal search) is in no single one
             hits = [bool(pick("".join(words[j:j + CJK_HIT_CHARS]))[0]) for j in range(len(words))]
         else:
             hits = [bool(pick(w)[0]) for w in words]
-        a, b = _window(words, hits)
+        a, b = _cut_window(words, hits)
         head, tail = head or a > 0, tail or b < len(words)
     return ("…" if head else "") + _between(text, spans, words, a, b) + ("…" if tail else "")
 
@@ -766,7 +930,7 @@ def _g_excerpt(v: DocView, refs: list[str], g_excerpt: str, pick: Callable[[str]
     lo, hi = covered[0], covered[-1] + 1
 
     def size(a: int, b: int) -> int:
-        return sum(len(_spans(pieces[j][1])) for j in range(a, b))
+        return sum(_size(pieces[j][1]) for j in range(a, b))
 
     while size(lo, hi) > EXCERPT_MAX_WORDS and hi - lo > 1:
         if pick(pieces[lo][1]) < pick(pieces[hi - 1][1]):
@@ -781,15 +945,17 @@ def _g_excerpt(v: DocView, refs: list[str], g_excerpt: str, pick: Callable[[str]
     words = [text[x:y] for x, y in spans]
     head, tail = lo > 0, hi < len(pieces)
     a, b = 0, len(words)
-    if len(words) > EXCERPT_MAX_WORDS:
-        a, b = _window(words, [bool(pick(w)[0]) for w in words])
+    if len(_counted(words)) > EXCERPT_MAX_WORDS:
+        a, b = _cut_window(words, [bool(pick(w)[0]) for w in words])
         head, tail = head or a > 0, tail or b < len(words)
     return segs[owner], ("…" if head else "") + _between(text, spans, words, a, b) + ("…" if tail else "")
 
 
 def _hit_line(v: DocView, rank: int, page: int, seg: Segment | None, terms: set[str], addr: bool, note: str = "",
-              also: set[str] = frozenset(), excerpt: str | None = None) -> str:
-    """"rank. t123 · p45 · s12 path | sentence" for the block part (or page) a hit narrows to."""
+              also: set[str] = frozenset(), excerpt: str | None = None, items: list[dict] | None = None,
+              flags: dict | None = None) -> str:
+    """"rank. t123 · p45 · s12 path | sentence" for the block part (or page) a hit narrows to; items, when given,
+    gets the hit as a reading trace records it (address, page, section shown, flags)."""
     sid = v.section_of(seg.block) if seg else None
     if sid and seg and v.section_heading.get(seg.block.ref) == sid:
         sid = v.sections[sid].get("parent")
@@ -797,19 +963,35 @@ def _hit_line(v: DocView, rank: int, page: int, seg: Segment | None, terms: set[
     path = _short_path(path.split(" > ")) if path else ""
     head = (f"{short_ref(seg.block.ref)} · " if addr and seg else "") + v.page_tag(page)
     text = excerpt if excerpt is not None else _excerpt_from(_pieces(v, seg), _term_pick(terms, also)) if seg else ""
+    if items is not None:
+        items.append({"r": rank, "a": short_ref(seg.block.ref) if addr and seg else None, "p": page,
+                      "sec": sid if path else None, **(flags or {})})
     return f"{rank}. {head}" + (f" · {sid} {path}" if path else "") + note + f" | {text}"
 
 
 def _exact_note(v: DocView, query: str) -> str:
     """For a short query: whether its exact text occurs at all (a semantic search alone cannot say)."""
+    return _exact(v, query)[0]
+
+
+def _exact(v: DocView, query: str) -> tuple[str, dict | None]:
+    """_exact_note's text, and what it says for a reading trace: matches, pages (the first three), pages in all."""
     if len(query.split()) > EXACT_CHECK_WORDS or not literal_key(query):
-        return ""
+        return "", None
     hits = _literal_hits(v, query)
     if not hits:
-        return " · exact text: 0 matches in this document"
+        return " · exact text: 0 matches in this document", {"n": 0, "pages": [], "pages_n": 0}
     pages = sorted({h[2].page for h in hits})
     shown = ", ".join(f"p{p}" for p in pages[:3]) + (f" +{len(pages) - 3} pages" if len(pages) > 3 else "")
-    return f" · exact text: {sum(h[1] for h in hits)} matches ({shown})"
+    n = sum(h[1] for h in hits)
+    return f" · exact text: {n} matches ({shown})", {"n": n, "pages": pages[:3], "pages_n": len(pages)}
+
+
+def _trace_exact(note: str, exact: dict | None) -> None:
+    """The exact-text count a search shows, as a signal and as the tool's addition (EXACT_CHECK_WORDS)."""
+    if note and exact is not None:
+        report(record.sig, "exact", **exact)
+        report(record.dec, "exact_note", src="EXACT_CHECK_WORDS", tokens=count_tokens(note))
 
 
 _IDENT = re.compile(r"[\"“”]([^\"“”]{3,80})[\"“”]"  # a quoted phrase
@@ -822,21 +1004,97 @@ def _ident_hits(v: DocView, query: str) -> list[str]:
     """For each number or quoted phrase in a semantic query: where its exact text occurs, best first
     by the query's other words (two semantic searches for "withdrawn controls incorporated SI-4" missed
     what one literal search found)."""
-    controls = any(n.get("number_kind") == "control" for n in v.sections.values())  # "GPT-3" is no control number
-    keys = list(dict.fromkeys(next(g for g in m.groups() if g) for m in _IDENT.finditer(query)
-                              if controls or not m.group(2)))[:IDENT_KEYS]
+    keys = ident_keys(v, query)
     out = []
+    found: list[tuple[str, int, list[str], list[int]]] = []  # for the trace: key, matches, blocks shown, their pages
     for key in keys:
         hits = _literal_hits(v, key)
         if not hits:
             out.append(f'literal "{key}": 0 matches')
+            found.append((key, 0, [], []))
             continue
         others = {w for w in _words(query) if _term(w)} - set(_words(key))
         hits.sort(key=lambda h: (-len(others & set(_words(h[2].text))), -h[0], h[2].page, h[2].block.order))
         out.append(f'literal "{key}": {sum(h[1] for h in hits)} matches, those with most query words:')
         out += [f"  {short_ref(o.ref)} · p{seg.page}{_hit_section(v, o)} | {_cut(_literal_excerpt(v, seg, key), IDENT_CHARS)}"
                 for _, _, seg, o in hits[:IDENT_HITS]]
+        found.append((key, sum(h[1] for h in hits), [o.ref for _, _, _, o in hits[:IDENT_HITS]],
+                      [seg.page for _, _, seg, _ in hits[:IDENT_HITS]]))
+    if out:
+        guarded(_trace_ident, found, out)
     return out
+
+
+def ident_keys(v: DocView, query: str, limit: int = IDENT_KEYS) -> list[str]:
+    """The numbers and quoted phrases of a query, in order, at most `limit`: quoted phrases, control numbers (only in
+    a document that has them: "GPT-3" is no control number), clause numbers, section signs."""
+    controls = any(n.get("number_kind") == "control" for n in v.sections.values())
+    return list(dict.fromkeys(next(g for g in m.groups() if g) for m in _IDENT.finditer(query)
+                              if controls or not m.group(2)))[:limit]
+
+
+def first_line(v: DocView, page: int, max_words: int = 50) -> str | None:
+    """For a rule's add first-line: how a page starts, from what it shows first (reading order) -- text: its first
+    sentence, and the next one (from the next block if need be: a short heading) while under EXCERPT_MIN_WORDS words,
+    at most max_words words; a table: its id and first row; a picture: its id and caption."""
+    words: list[str] = []
+    taken = 0
+    for seg in sorted(v.page_segments(page), key=v.place):
+        b = seg.block
+        if b.in_picture or not v.visible(b, page) or not (seg.text.strip() or b.kind == "picture"):
+            continue
+        if b.kind in ("table", "picture"):
+            if words:
+                break
+            if b.kind == "table":
+                row = next((r for r in table_rows(v, b) if any(c.strip() for c in r)), [])
+                return f"{short_ref(b.ref)} " + " | ".join(" ".join(c.split()) for c in row)
+            caps = [v.doc.by_ref[x["$ref"]].text for x in v.doc.item(b.ref).get("captions", []) if x.get("$ref") in v.doc.by_ref]
+            return f"{short_ref(b.ref)} " + (" ".join(caps[0].split()) if caps else "")
+        for piece in _pieces(v, seg):
+            words += v.display(piece).split()
+            taken += 1
+            if taken == 2 or len(words) >= EXCERPT_MIN_WORDS:
+                break
+        if taken == 2 or len(words) >= EXCERPT_MIN_WORDS:
+            break
+    if not words:
+        return None
+    return " ".join(words[:max_words]) + (" …" if len(words) > max_words else "")
+
+
+def unread_headings(v: DocView, rest: list[str], seen: set[int], limit: int = 12) -> tuple[list[str], list[str]]:
+    """For a rule's add unread-headings: the sections a cut read did not reach -- those opening in what its next:
+    addresses cover (subsections after the cut) and section addresses not begun -- one line each as the contents of
+    a long read show them, at most `limit` and "+N more"; sections whose pages were all shown are left out. Also
+    their ids."""
+    tokens = _block_tokens(v.name)
+    sids: list[str] = []
+    for a in rest:
+        base, _, cursor = a.partition(" from ")
+        if base.strip() in v.sections and not cursor:
+            sids.append(base.strip())
+        sids += [sid for seg in resolve(v, a).segments if (sid := v.section_heading.get(seg.block.ref))]
+    lines, listed = [], []
+    for sid in dict.fromkeys(sids):
+        span = v.section_pages(sid)
+        if not span or set(range(span[0], span[1] + 1)) <= seen:
+            continue
+        n = v.sections[sid]
+        label = v.section_label(sid)
+        lines.append(f"{sid} · {v.page_range_tag(*span)}" + (f" · {_cut(label, 70)}" if label else "")
+                     + f" · {_tok(sum(tokens[n['start_order']:n['end_order']]))}")
+        listed.append(sid)
+    more = len(lines) - limit
+    return lines[:limit] + ([f"+{more} more"] if more > 0 else []), listed[:limit]
+
+
+def _trace_ident(found: list[tuple[str, int, list[str], list[int]]], out: list[str]) -> None:
+    """The identifier hits a search adds: each key (as record.said keeps the caller's text), its matches, the
+    blocks shown and their pages."""
+    report(record.sig, "ident", items=[{"key": record.said(k), "n": n, "shown": [short_ref(r) for r in refs], "pages": pages}
+                                       for k, n, refs, pages in found])
+    report(record.dec, "ident_hits", src="M6.ident_hits", keys=len(found), tokens=count_tokens("\n".join(out)))
 
 
 def _hit_section(v: DocView, b: Block) -> str:
@@ -856,36 +1114,79 @@ def _g_search(v: DocView, query: str, k: int, unit: str) -> str:
     from tglw.search import search as g_search
 
     hits = g_search(v.name, query, k=k, unit=unit)
-    note = _exact_note(v, query)
+    note, exact = _exact(v, query)
     if not hits and cjk():  # G (CJK on) finds nothing only when no query word is in its index
-        lines = [f'search "{query}" · {unit}s · top {k} · engine G' + ("" if " 0 matches" in note else note), NO_WORDS]
+        shown = "" if " 0 matches" in note else note
+        lines = [f'search "{query}" · {unit}s · top {k} · engine G' + shown, NO_WORDS]
+        guarded(_trace_exact, shown, exact)
+        report(record.sig, "zero", mode="bm25", why="no_words")
         return "\n".join(lines + (_ident_hits(v, query) if M6["ident_hits"] else []))
     lines = [f'search "{query}" · {unit}s · top {k} · engine G' + note]
+    guarded(_trace_exact, note, exact)
+    shown = hit_lines(v, query, hits, unit)
+    lines += [h.line for h in shown]
+    if record.current() is not None:
+        report(record.sig, "hits", mode="bm25", unit=unit, top=k, n=len(shown),
+               items=[{"r": r, "a": h.addr, "p": h.page, "sec": h.sec, **h.flags} for r, h in enumerate(shown, 1)])
+        guarded(_trace_zero, hits)
+    return "\n".join(lines + (_ident_hits(v, query) if M6["ident_hits"] else []))
+
+
+def _trace_zero(hits: list) -> None:
+    """The zero signal of a default search, as task SRCH defines it (no hit scoring above 0 after G's near-spelling
+    retry; a page search's 0-score pages count as none)."""
+    from tglw.search.absence import no_match
+    if no_match(hits):
+        report(record.sig, "zero", mode="bm25")
+
+
+class HitLine(NamedTuple):
+    """A search hit as search shows it: its line, the address and page the line names, the section it shows, and
+    what a trace notes about it (fuzzy, fig: a hit in a picture, after: the block after a short heading)."""
+    line: str
+    addr: str | None
+    page: int
+    sec: str | None
+    flags: dict
+
+
+def hit_lines(v: DocView, query: str, hits: list, unit: str = "block", start: int = 1) -> list[HitLine]:
+    """Task G's hits (tglw.search) as search lists them, numbered from `start`, each narrowed to the block part (or,
+    for pages, the part of the page) with the most query words: address, page, section and hit sentence. Reports
+    nothing to a trace (task SRCH's absence lists hits the same way); call it inside _cjk_of(v), as search does."""
     terms = {w for w in _words(query) if _term(w)}
-    for rank, h in enumerate(hits, 1):
+    out: list[HitLine] = []
+    for rank, h in enumerate(hits, start):
         fuzzy = " · fuzzy" if getattr(h, "fuzzy", False) else ""
+        flags = {"fuzzy": True} if fuzzy else {}
+        item: list[dict] = []
         fig = getattr(h, "figure", None)  # G v4: a hit in a picture's caption or labels, read as the picture
         if unit == "block" and fig and fig in v.doc.by_ref:
             pic = v.doc.by_ref[fig]
-            lines.append(_hit_line(v, rank, pic.page, Segment(pic, pic.page, ""), terms, addr=True, note=" · figure" + fuzzy,
-                                   excerpt=_excerpt(v.display(squeeze(h.excerpt)), terms)))
-            continue
-        pick = _term_pick(terms, set(_words(h.excerpt)))
-        refs = list(h.refs) if unit == "block" and getattr(h, "refs", None) else [b.ref for b in v.by_page.get(h.page, [])]
-        head = _short_heading(v, refs) if unit == "block" and V1["heading_next"] else None
-        after = _block_after(v, head) if head is not None else None
-        refs = refs + [after.ref] if after is not None else refs
-        found = _g_excerpt(v, refs, h.excerpt, pick) or _passage(v, refs, pick)
-        if found and unit == "page" and found[0].page != h.page:
-            found = None
-        if found is None:
-            lines.append(f"{rank}. {v.page_tag(h.page)}{fuzzy} | {_excerpt(v.display(squeeze(h.excerpt)), terms)}")
-            continue
-        seg, text = found
-        if after is not None and head is not None:
-            seg = next((s for s in v.block_segments(head) if v.visible(head, s.page)), seg)  # the hit stays the heading
-        lines.append(_hit_line(v, rank, seg.page, seg, terms, addr=unit == "block", note=fuzzy, excerpt=text))
-    return "\n".join(lines + (_ident_hits(v, query) if M6["ident_hits"] else []))
+            line = _hit_line(v, rank, pic.page, Segment(pic, pic.page, ""), terms, addr=True, note=" · figure" + fuzzy,
+                             excerpt=_excerpt(v.display(squeeze(h.excerpt)), terms), items=item, flags={**flags, "fig": True})
+        else:
+            pick = _term_pick(terms, set(_words(h.excerpt)))
+            refs = list(h.refs) if unit == "block" and getattr(h, "refs", None) else [b.ref for b in v.by_page.get(h.page, [])]
+            head = _short_heading(v, refs) if unit == "block" and V1["heading_next"] else None
+            after = _block_after(v, head) if head is not None else None
+            refs = refs + [after.ref] if after is not None else refs
+            found = _g_excerpt(v, refs, h.excerpt, pick) or _passage(v, refs, pick)
+            if found and unit == "page" and found[0].page != h.page:
+                found = None
+            if found is None:
+                line = f"{rank}. {v.page_tag(h.page)}{fuzzy} | {_excerpt(v.display(squeeze(h.excerpt)), terms)}"
+                item.append({"r": rank, "a": None, "p": h.page, "sec": None, **flags})
+            else:
+                seg, text = found
+                if after is not None and head is not None:
+                    seg = next((s for s in v.block_segments(head) if v.visible(head, s.page)), seg)  # the hit stays the heading
+                    flags["after"] = short_ref(after.ref)
+                line = _hit_line(v, rank, seg.page, seg, terms, addr=unit == "block", note=fuzzy, excerpt=text,
+                                 items=item, flags=flags)
+        i = item[0]
+        out.append(HitLine(line, i["a"], i["p"], i["sec"], {k: x for k, x in i.items() if k not in ("r", "a", "p", "sec")}))
+    return out
 
 
 def _short_heading(v: DocView, refs: list[str]) -> Block | None:
@@ -949,13 +1250,24 @@ def _literal_hits(v: DocView, query: str) -> list[tuple[int, int, Segment, Block
         return _literal_hits_in(v, query)
 
 
-def _literal_hits_in(v: DocView, query: str) -> list[tuple[int, int, Segment, Block]]:
-    q = literal_key(query)
-    if not q:
-        return []
-    han = cjk() and bool(_HAN_CHAR.search(q))  # Han text has no word boundaries: an end in Han needs none
-    word = re.compile(("" if han and _HAN_CHAR.match(q[0]) else r"(?<!\w)") + re.escape(q)
-                      + ("" if han and _HAN_CHAR.match(q[-1]) else r"(?!\w)"))
+LITERAL_RESULTS = 512  # literal searches remembered per view (task SRCH's cache, least recently used dropped)
+_LITERAL_LOCK = threading.Lock()
+
+
+def _literal_state() -> tuple:
+    """What literal matching depends on besides the view and the query: CJK and folding for the document being
+    searched, and the views switches (visible() reads V1 at each call)."""
+    return cjk(), _fold(), tuple(sorted(V1.items()))
+
+
+def _literal_corpus(v: DocView) -> tuple[tuple[tuple[Segment, Block, str], ...], OrderedDict]:
+    """Every shown text or table segment with the block that reads it (text inside a picture: its picture) and its
+    literal_key, and the view's remembered results; kept on the view, one entry per _literal_state()."""
+    state = _literal_state()
+    caches = v.__dict__.setdefault("_literal_cache", {})
+    entry = caches.get(state)
+    if entry is not None:
+        return entry
     out = []
     for b in v.doc.blocks:
         if b.kind not in ("text", "table"):
@@ -973,11 +1285,39 @@ def _literal_hits_in(v: DocView, query: str) -> list[tuple[int, int, Segment, Bl
                 continue
             if owner is not b and v.hidden(s.page, owner.ref):
                 continue
-            t = literal_key(s.text)
-            n = t.count(q)
-            if n:
-                out.append((len(word.findall(t)), n, s, owner))
-    return _one_per_picture(out)
+            out.append((s, owner, literal_key(s.text)))
+    return caches.setdefault(state, (tuple(out), OrderedDict()))
+
+
+def literal_cache_clear(v: DocView | None = None) -> None:
+    """Forget the cached segments and results of literal matching: of one view, or of every view `view` holds."""
+    for x in [v] if v is not None else list(view.cache_store.values()):
+        x.__dict__.pop("_literal_cache", None)
+
+
+def _literal_hits_in(v: DocView, query: str) -> list[tuple[int, int, Segment, Block]]:
+    q = literal_key(query)
+    if not q:
+        return []
+    corpus, results = _literal_corpus(v)
+    with _LITERAL_LOCK:
+        if q in results:
+            results.move_to_end(q)
+            return list(results[q])
+    han = cjk() and bool(_HAN_CHAR.search(q))  # Han text has no word boundaries: an end in Han needs none
+    word = re.compile(("" if han and _HAN_CHAR.match(q[0]) else r"(?<!\w)") + re.escape(q)
+                      + ("" if han and _HAN_CHAR.match(q[-1]) else r"(?!\w)"))
+    out = []
+    for s, owner, t in corpus:
+        n = t.count(q)
+        if n:
+            out.append((len(word.findall(t)), n, s, owner))
+    hits = _one_per_picture(out)
+    with _LITERAL_LOCK:
+        results[q] = tuple(hits)
+        while len(results) > LITERAL_RESULTS:
+            results.popitem(last=False)
+    return hits
 
 
 def _one_per_picture(hits: list[tuple[int, int, Segment, Block]]) -> list[tuple[int, int, Segment, Block]]:
@@ -1009,6 +1349,7 @@ def literal_search(v: DocView, query: str, k: int, unit: str) -> str:
     the hits, whole-word matches first."""
     hits = sorted(_literal_hits(v, query), key=figure_rank.block_key)  # task VIS (E7): hits in figures after text hits
     if not hits:
+        report(record.sig, "zero", mode="literal")
         return (f'0 matches for "{query}" in this document (exact text, any case, tables included)\n'
                 "try other wording, or mode='bm25' (it retries with near spellings when nothing matches)")
     total = sum(h[1] for h in hits)
@@ -1017,6 +1358,9 @@ def literal_search(v: DocView, query: str, k: int, unit: str) -> str:
     if sections:
         lines.append("section number: " + "; ".join(f"{sid} {v.section_label(sid)}" for sid in sections[:3])
                      + f" (read('{query}') reads it)")
+    trace = {"mode": "literal", "unit": unit, "top": k, "total": total, "blocks": len(hits)} | \
+        ({"sections": sections[:3]} if sections else {})
+    items: list[dict] = []
     if unit == "page":
         pages: dict[int, list[tuple[int, int, Segment]]] = {}
         for h in hits:
@@ -1028,12 +1372,16 @@ def literal_search(v: DocView, query: str, k: int, unit: str) -> str:
             path = _short_path(v.section_path(sid).split(" > ")) if sid and v.sections.get(sid, {}).get("kind") != "root" else ""
             lines.append(f"{rank}. {v.page_tag(page)} · {sum(h[1] for h in hs)}×" + (f" · {sid} {path}" if path else "")
                          + f" | {_literal_excerpt(v, seg, query)}")
+            items.append({"r": rank, "a": None, "p": page, "sec": sid if path else None, "n": sum(h[1] for h in hs)})
+        report(record.sig, "hits", **trace, n=len(items), items=items)
         return "\n".join(lines)
     for rank, (_, n, seg, owner) in enumerate(hits[:k], 1):
         sid = v.section_of(owner)
         path = _short_path(v.section_path(sid).split(" > ")) if sid and v.sections.get(sid, {}).get("kind") != "root" else ""
         lines.append(f"{rank}. {short_ref(owner.ref)} · {v.page_tag(seg.page)} · {n}×" + (f" · {sid} {path}" if path else "")
                      + f" | {_literal_excerpt(v, seg, query)}")
+        items.append({"r": rank, "a": short_ref(owner.ref), "p": seg.page, "sec": sid if path else None, "n": n})
+    report(record.sig, "hits", **trace, n=len(items), items=items)
     return "\n".join(lines)
 
 
@@ -1061,7 +1409,10 @@ def _search(v: DocView, query: str, k: int, unit: str, engine: str, mode: str) -
     scores = bm.get_scores(q)
     order = sorted(range(len(units)), key=lambda i: -scores[i])[:k]
     terms = set(q)
-    lines = [f'search "{query}" · {unit}s · top {len(order)}' + _exact_note(v, query)]
+    note, exact = _exact(v, query)
+    lines = [f'search "{query}" · {unit}s · top {len(order)}' + note]
+    guarded(_trace_exact, note, exact)
+    items: list[dict] = []
     for rank, i in enumerate(order, 1):
         if scores[i] <= 0:
             break
@@ -1069,7 +1420,10 @@ def _search(v: DocView, query: str, k: int, unit: str, engine: str, mode: str) -
         if seg is None:
             seg = _best_segment(v, list(dict.fromkeys(b.ref for b in v.by_page.get(page, []))), terms)
             seg = seg if seg and seg.page == page else None
-            lines.append(_hit_line(v, rank, page, seg, terms, addr=False))
+            lines.append(_hit_line(v, rank, page, seg, terms, addr=False, items=items))
         else:
-            lines.append(_hit_line(v, rank, page, seg, terms, addr=True))
+            lines.append(_hit_line(v, rank, page, seg, terms, addr=True, items=items))
+    report(record.sig, "hits", mode="bm25", unit=unit, top=k, n=len(items), items=items)
+    if not items:
+        report(record.sig, "zero", mode="bm25")
     return "\n".join(lines + (_ident_hits(v, query) if M6["ident_hits"] else []))

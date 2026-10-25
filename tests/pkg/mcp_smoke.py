@@ -24,7 +24,8 @@ TOOLS = ("list_documents", "outline", "read", "context", "search", "region")
 
 
 def server(home: Path, command: list[str]) -> StdioServerParameters:
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("TGL_", "TGLW_", "VESTIGIUM_"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("TGL_", "TGLW_", "VESTIGIUM_"))
+           or k == "TGLW_RULES"}  # the caller decides whether rules run
     home = home.resolve()
     env.update({HOME_ENV: str(home), "PYTHONDONTWRITEBYTECODE": "1"})
     return StdioServerParameters(command=command[0], args=command[1:], cwd=str(home), env=env)

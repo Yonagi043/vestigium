@@ -57,10 +57,10 @@ def prompt(entry: dict, sheets: Path) -> str:
                    "\nOpen them to check values read from charts, maps, diagrams or scans; such values are estimates, and "
                    "the notes give the reading tolerance. A value read from a figure need not appear in the document text: "
                    "do not call it fabricated for that reason, judge it against the screenshot and the notes.\n") if images else ""
-    files = ("the .md sheet" if n == 1 else f"the {WORDS[n]} .md sheets") + f", the document text{'s' if len(texts) > 1 else ''}" + \
+    files = ("the .md sheet" if n == 1 else f"the {WORDS.get(n, str(n))} .md sheets") + f", the document text{'s' if len(texts) > 1 else ''}" + \
             (" and the screenshots" if images else "")
     intro = ("Grade one answer to a question. It is on a grading sheet with a random code." if n == 1 else
-             f"Grade {WORDS[n]} answers to the same question. Each is on its own grading sheet; the sheets carry random codes "
+             f"Grade {WORDS.get(n, str(n))} answers to the same question. Each is on its own grading sheet; the sheets carry random codes "
              "and are in random order. Grade each answer against the facets on its own; do not compare the answers with one "
              "another or let one answer change how you grade another.")
     shared = ("" if n == 1 else " The sheets share the question, facets, reference answer and notes; only the answer differs. "

@@ -7,7 +7,9 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 
-from . import switches
+from tglw.trace import record
+
+from . import switches, tracing
 from .inline import is_figure
 
 _LINE = re.compile(r"^(?P<indent>\s*)(?P<sid>s\d+) ")
@@ -44,4 +46,11 @@ def mark_outline(name: str, text: str) -> str:
             cut = line.rfind(" · +")
             line = line[:cut] + tag + line[cut:] if cut > 0 and line.endswith(" sub") else line + tag
         out.append(line)
-    return "\n".join(out)
+    new = "\n".join(out)
+    if new != text:
+        tracing.guarded(_report_counts, text, new)
+    return new
+
+
+def _report_counts(text: str, new: str) -> None:
+    record.dec("fig_hints", src=switches.env_name("OUTLINE_FIGS"), tokens=tracing.added(text, new))

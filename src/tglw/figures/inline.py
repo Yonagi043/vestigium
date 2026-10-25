@@ -94,6 +94,13 @@ def labels_ocr(name: str, ref: str) -> bool:
     return got < OCR_LAYER_SHARE * want
 
 
+def applied(line: str, fig: str) -> set[str]:
+    """The switches that changed a figure line picture_line returned (for the trace)."""
+    return ({"FIG_HINT"} if line.endswith(f" (image: region {fig})") else set()) \
+        | ({"FIG_LABELS"} if f" labels; read {fig} for all]" in line else set()) \
+        | ({"OCR_NOTE"} if line.startswith(f"[{fig}, labels by OCR") else set())
+
+
 def picture_line(v: Any, b: Any, full: bool = False) -> str:
     """The read line for a picture. With FIG_HINT, FIG_LABELS and OCR_NOTE all off it is exactly
     views.render.render_picture's line; full keeps every label (the figure itself was asked for)."""

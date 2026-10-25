@@ -6,7 +6,15 @@ Vestigium lets an AI agent read long, messy PDFs (annual reports, regulations, t
 
 [中文说明](README_ZH.md)
 
-Measured inside Claude Code, on new hard questions about long English public reports, with the test method fixed before the runs:
+> **New in 0.1.1**
+> - **Fewer early stops** (on by default): when a section goes on to the next page, Vestigium brings that page along, so your agent stops halfway less often.
+> - **See how it read** (optional): every reading is recorded on your machine (`TGLW_TRACE=0` turns it off); turn on the `trace` tool and ask your agent how it read a document last time.
+> - **Tell it how to read** (optional): with the `rules` tool, your agent writes rules that Vestigium carries out itself; undo them or restore the factory rules at any time.
+> - **Still local**: nothing is uploaded.
+>
+> Measured results (they vary from run to run): accuracy no worse than 0.1.0; cost about 3% lower and time about 5% shorter on average, within the variation. See [Results: 0.1.1](docs/RESULTS_0_1_1.md).
+
+Measured with version 0.1.0 inside Claude Code, on new hard questions about long English public reports, with the test method fixed before the runs:
 
 - **Claude Haiku: no worse than giving it the whole document, at about half the cost and time.** Accuracy **+1.2 points** [−1.8, +4.4] against the whole text searched with Claude Code's own tools, within the 5-point bound set in advance; cost **0.51**, time **0.54**.
 - **Claude Haiku: 21 points more accurate than reading the PDF, at about a quarter of the cost.** **+21.2 points** [+12.3, +30.8]; cost **0.25**; **no made-up facts** (6 with the PDF).
@@ -70,7 +78,7 @@ With Claude Haiku 4.5:
 
 - **Made-up facts**: none with Vestigium or with the text file; with the PDF, the judge marked 6 answer points as made up.
 - **Larger model** (Claude Opus 5.5): 100% with Vestigium and 99.6% with the text file on 27 hard questions. Both are at the ceiling, so this test cannot tell them apart. Vestigium cost 0.80 of the text file.
-- **This release** adds features on top of the tested version. On 65 development questions with Haiku it showed no regression: 97.2% against 97.1%, at 0.92 of the cost. The difference is too small to call it better.
+- **The 0.1.0 release** added features on top of the tested version. On 65 development questions with Haiku it showed no regression: 97.2% against 97.1%, at 0.92 of the cost. The difference is too small to call it better.
 
 | You want | Use | In our test |
 |---|---|---|
@@ -130,9 +138,18 @@ Step by step, with the sample PDF and checks: [Quick start](docs/QUICKSTART.md).
 
 Full reference, address forms and switches: [Tools](docs/TOOLS.md).
 
+0.1.1 adds two optional tools, off by default:
+
+| Tool | What it does | Turn on with |
+|---|---|---|
+| `trace` | How earlier readings went, step by step, in the [reading language](docs/LANGUAGE.md) | `TGLW_TRACE_TOOL=1` |
+| `rules` | List, add, change, preview and undo [rules](docs/RULES.md) that the tools carry out themselves; reset or turn them all off | `TGLW_RULES_TOOL=1` |
+
+Pass the switches when you connect the server, for example `claude mcp add --env TGLW_TRACE_TOOL=1 --env TGLW_RULES_TOOL=1 --transport stdio vestigium -- vestigium mcp`. If you added the server before with `--scope user`, first run `claude mcp remove --scope user vestigium`, then add it again with the switches and `--scope user`.
+
 ## Agent apps
 
-- **Claude Code**: tested over local stdio. A long-running HTTP mode is new in this release; it connects, but was not used in our answer tests.
+- **Claude Code**: tested over local stdio. A long-running HTTP mode was added in 0.1.0; it connects, but was not used in our answer tests.
 - **VS Code (Copilot), Cursor and other MCP clients**: configuration examples are provided. By the protocol they should connect, but we have not tested them.
 - **No MCP?** Apps whose agent can read files can use a plain-file export instead. We have tested this only in Claude Code: it passed a small check fixed in advance, so where MCP is not available we recommend it instead of a single whole-text file. It costs about twice as much as using MCP.
 
@@ -146,9 +163,13 @@ See [Agent apps](docs/CLIENTS.md).
 | [Agent apps](docs/CLIENTS.md) | Claude Code, VS Code, Cursor, HTTP mode, file export |
 | [Tools](docs/TOOLS.md) | The six tools, addresses, allowlist, switches |
 | [Results](docs/RESULTS.md) | What we measured and what it shows |
+| [Results: 0.1.1](docs/RESULTS_0_1_1.md) | What changed in 0.1.1, with numbers |
 | [Methods](docs/METHODS.md) | How the comparison was kept fair, and how to reproduce it |
 | [Similar projects](docs/RELATED.md) | Tree-navigation and hierarchical-retrieval work |
 | [Limits and FAQ](docs/FAQ.md) | Known weaknesses and common questions |
+| [Reading language](docs/LANGUAGE.md) | The small language for traces and rules |
+| [Traces](docs/TRACES.md) | How a document was read: asking your agent, what is stored |
+| [Rules](docs/RULES.md) | How future readings should go: writing, preview, undo, reset, all off |
 
 ## The name
 

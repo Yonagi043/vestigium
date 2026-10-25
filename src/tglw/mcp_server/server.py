@@ -16,6 +16,15 @@ M8 switches (each can be turned off on its own; session state only adds to what 
 - lenient_params: a string where a list is expected is a one-item list, null takes the default;
 - saturation_hint: a search most of whose hits were listed before ends with a pointer to literal search.
 
+Reading traces: every tool call is recorded as one event (tglw.trace.record has the format) with
+what the code that shows a signal or makes a choice reports where it does so; main() hands the events to the
+local store (tglw.store.traces, under paths.trace_dir()). TGLW_TRACE=0: nothing is recorded or written. Recording
+never changes a return.
+
+Tool switches (TOOL_SWITCHES): trace_tool (TGLW_TRACE_TOOL=1): a seventh tool, trace, shows the recorded readings in
+the reading language (tglw.trace.query, which also holds its description and help); rules_tool (TGLW_RULES_TOOL=1):
+a tool for the reading rules (rules_tool). Both off by default: the six reading tools only.
+
 V1 switches (task V1-INT; set in the environment before the server starts):
 - limits (TGLW_MCP_LIMITS = auto | off | vscode | copilot): output limits by client, auto = by the name the
   client gives when it connects; off = Claude Code's for every client;
@@ -26,32 +35,41 @@ V1 switches (task V1-INT; set in the environment before the server starts):
 from __future__ import annotations
 
 import argparse
+import atexit
+import functools
+import hashlib
+import inspect
 import json
 import os
 import re
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS
-from pydantic import BeforeValidator
+from pydantic import BeforeValidator, ValidationError
 
-from tglw import COMMAND, NAME, PACKAGE, views
+from tglw import COMMAND, NAME, PACKAGE, VERSION, views
+from tglw.trace import record
 from tglw.views.switches import switch
+from tglw.views.tracing import guarded, lost, report
 from tglw.views.context import context as view_context
 
 from tglw.common.text import count_tokens
 
 from tglw import figures
 
-from . import tools
+from . import executor, tools
 from tglw.figures import region as figures_region
 
 READ_CAP = 8000
@@ -67,6 +85,8 @@ V1 = {"limits": os.environ.get("TGLW_MCP_LIMITS", "").strip().lower() or "auto",
       "answer_hint": switch("TGLW_MCP_ANSWER_HINT", False), "library": switch("TGLW_SEARCH_LIBRARY", False),
       "doc_addresses": switch("TGLW_READ_DOC_ADDR", False), "list": switch("TGLW_SEARCH_LIST", False),
       "qc_notes": switch("TGLW_ING_QC_NOTES", True)}
+TOOL_SWITCHES = {"trace_tool": switch("TGLW_TRACE_TOOL", False), "rules_tool": switch("TGLW_RULES_TOOL", False)}
+TRACE_LAST_CAP = 10  # readings one trace call shows at most
 
 INSTRUCTIONS = (
     "Read long PDFs by address: outline(doc), search(doc, query), read(doc, addrs) several at once, "
@@ -81,8 +101,28 @@ def instructions() -> str:
     return figures.cost.instructions(INSTRUCTIONS) + (" " + ANSWER_HINT if V1["answer_hint"] else "")
 
 
+class _Server(MCPServer):
+    """MCPServer that also records a call whose arguments fail validation (the tool body, which records every
+    other call, does not run then)."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any], context: Context | None = None) -> Any:
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError as err:
+            if isinstance(err.__cause__, ValidationError) and name in TOOL_NAMES and record.enabled():
+                try:
+                    _trace_start()
+                    with record.call(name, dict(arguments or {}), conv=_conv(context), client=_client(context),
+                                     **(TRACE_EXTRA.get() or {})) as ev:
+                        ev.error(err.__cause__)
+                except Exception:  # noqa: BLE001 - the trace loses the call; the client gets the same error
+                    lost("call")
+            raise
+
+
+TOOL_NAMES = ("list_documents", "outline", "read", "context", "search", "region")
 # serverInfo.name; Claude Code names the tools (mcp__<key>__read) and the instructions block by its own config key
-server = MCPServer(PACKAGE, instructions=instructions())
+server = _Server(PACKAGE, instructions=instructions())
 _HIT = re.compile(r"^(\d+\. )(\S+)(.*?)( \| .*)?$")
 _PAGE_MARK = re.compile(r"^== p(\d+)\b|\s\[p(\d+)\]\s", re.M)
 ADJACENT_NOTE = "[adjacent pages that match your searches]"
@@ -92,11 +132,21 @@ SATURATION_NOTE = "most hits were listed before; whether the document states som
 @dataclass
 class Session:
     """What one conversation was shown, per document: hits with their excerpt ("seen"), hit addresses
-    (saturation), its semantic queries and the pages delivered by read or context (adjacent pages)."""
+    (saturation), its semantic queries and the pages delivered by read or context (adjacent pages); for rules
+    (executor): the hits' addresses, sections and pages (from-hit), the images seen, per rule the calls it added
+    to (max), the literal searches (coverage), the count of searches (searches) and the last coverage summary sent
+    (coverage, which TGLW_COVERAGE_DELTA's next summary builds on)."""
     seen: dict[str, set[str]] = field(default_factory=dict)
     listed: dict[str, set[str]] = field(default_factory=dict)
     queries: dict[str, list[str]] = field(default_factory=dict)
     pages: dict[str, set[int]] = field(default_factory=dict)
+    hits: dict[str, dict[str, set]] = field(default_factory=dict)
+    images: dict[str, set[str]] = field(default_factory=dict)
+    uses: dict[str, int] = field(default_factory=dict)
+    literal: dict[str, list[str]] = field(default_factory=dict)
+    quick_shown: bool = False  # the rules tool appended its quick reference to a refused rule (once per conversation)
+    searches: int = 0  # search calls in this conversation, library searches included (a rule's searches condition)
+    coverage: dict[str, Any] = field(default_factory=dict)  # the last coverage summary sent, per document (delta)
 
 
 HTTP_SESSIONS = 256  # conversations a resident server remembers (least recently used dropped)
@@ -104,6 +154,7 @@ _process = Session()  # stdio: the process serves one conversation
 _sessions: OrderedDict[str, Session] = OrderedDict()
 _sessions_lock = threading.Lock()
 _http = False  # set by main(--http)
+SESSION: ContextVar[Session | None] = ContextVar("tglw_session", default=None)  # a preview replays in its own
 
 
 def reset_session() -> None:
@@ -113,22 +164,161 @@ def reset_session() -> None:
         _sessions.clear()
 
 
-def _session(ctx: Context | None) -> Session:
+def _key(ctx: Context | None) -> str | None:
     """The conversation a call belongs to: VS Code's conversation id when the call carries one (one VS Code
-    window shares a server between its chats), else under --http the MCP session; a stdio server is one
-    conversation, and an HTTP call with neither id (2026-07-28, with --new-protocol) gets a fresh one."""
+    window shares a server between its chats), else under --http the MCP session; None for a stdio call without
+    one, and for an HTTP call with neither id (2026-07-28, with --new-protocol)."""
     if ctx is None:
-        return _process
+        return None
     meta = ctx.request_context.meta or {}
     key = meta.get("vscode.conversationId") or (_http and (ctx.headers or {}).get("mcp-session-id"))
+    return str(key) if key else None
+
+
+def _session(ctx: Context | None) -> Session:
+    """What the call's conversation was shown (_key): a stdio server is one conversation, and an HTTP call with no
+    conversation gets a fresh one (a preview's replay: SESSION)."""
+    if (given := SESSION.get()) is not None:
+        return given
+    if ctx is None:
+        return _process
+    key = _key(ctx)
     if not key:
         return Session() if _http else _process
     with _sessions_lock:
-        s = _sessions.pop(str(key), None) or Session()
-        _sessions[str(key)] = s
+        s = _sessions.pop(key, None) or Session()
+        _sessions[key] = s
         while len(_sessions) > HTTP_SESSIONS:
             _sessions.popitem(last=False)
     return s
+
+
+# ---- reading traces --------------------------------------------------------------------------------------------
+
+TRACE_EXTRA: ContextVar[dict[str, Any] | None] = ContextVar("tglw_trace_extra", default=None)  # e.g. a replay's origin
+
+
+def _traced(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """The tool, recorded as one trace event per call: arguments as the client sent them, conversation, client,
+    and the size of what it returns. What it returns or raises is the same as without recording: a failure of the
+    recording itself is counted as lost (views.tracing) and the call goes on."""
+    tool, params = fn.__name__, inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def traced(*args: Any, **kwargs: Any) -> Any:
+        rules = executor.on()
+        opened = _open(tool, params, args, kwargs, rules) if record.enabled() or rules else None
+        if opened is None:
+            return fn(*args, **kwargs)
+        cm, ev = opened
+        try:
+            out = fn(*args, **kwargs)
+        except BaseException as err:
+            _close(cm, err)
+            raise
+        guarded(ev.result, out)
+        _close(cm, None)
+        return out
+    return traced
+
+
+def _open(tool: str, params: inspect.Signature, args: tuple, kwargs: dict[str, Any],
+          rules: bool = False) -> tuple[Any, Any] | None:
+    """The call's record entered (collected even with recording off when rules are in effect: the executor needs
+    its signals), or None when that fails (the call then runs unrecorded, counted as lost)."""
+    try:
+        try:
+            given = params.bind_partial(*args, **kwargs).arguments
+        except TypeError:  # the call itself raises it, recorded as its error
+            given = dict(kwargs)
+        ctx = given.get("ctx")
+        _trace_start()
+        cm = record.call(tool, _given(ctx, given), conv=_conv(ctx), client=_client(ctx), collect=rules,
+                         **(TRACE_EXTRA.get() or {}))
+        return cm, cm.__enter__()
+    except Exception:  # noqa: BLE001 - see _traced
+        lost("call")
+        return None
+
+
+def _close(cm: Any, err: BaseException | None) -> None:
+    """The call's record left: after its return, or with the tool's own error (recorded; the caller raises it)."""
+    try:
+        if err is None:
+            cm.__exit__(None, None, None)
+        else:
+            cm.__exit__(type(err), err, err.__traceback__)
+    except BaseException as other:  # noqa: BLE001 - see _traced
+        if other is not err:
+            lost("call")
+
+
+def _given(ctx: Context | None, bound: dict[str, Any]) -> dict[str, Any]:
+    """The arguments as the client sent them (before the lenient parameters' conversions), else as passed."""
+    try:
+        params = ctx.request_context.params if ctx is not None else None
+        raw = params.get("arguments") if params is not None else None
+    except Exception:  # noqa: BLE001 - no request context: a direct call
+        raw = None
+    return dict(raw) if isinstance(raw, dict) else {k: v for k, v in bound.items() if k != "ctx"}
+
+
+def _conv(ctx: Context | None) -> str:
+    """The trace's conversation: _session's key; "stdio" for a stdio server; an HTTP call without one is its own."""
+    try:
+        key = _key(ctx)
+    except Exception:  # noqa: BLE001 - no request context
+        key = None
+    return key or (f"http-{uuid.uuid4().hex[:12]}" if _http and ctx is not None else "stdio")
+
+
+def _client(ctx: Context | None) -> dict[str, Any] | None:
+    try:
+        info = ctx.session.client_params.client_info if ctx is not None else None
+    except Exception:  # noqa: BLE001 - no session: a direct call
+        info = None
+    return {"name": info.name, "version": info.version} if info is not None else None
+
+
+_proc_sent = [False]
+
+
+def _trace_start() -> None:
+    if not _proc_sent[0]:
+        _proc_sent[0] = True
+        try:
+            info = proc_info()
+        except Exception as err:  # noqa: BLE001 - the process event says so, the calls are still recorded
+            lost("proc")
+            info = {"proc_info_error": type(err).__name__}
+        record.start(**info)
+
+
+def proc_info() -> dict[str, Any]:
+    """The trace's process event: package and code, delivered sidecar versions, switches, transport, limits."""
+    from tglw.views import sidecars
+    return {"pkg": VERSION, "tglw": code_id(), "data": sidecars.versions(), "switches": switch_values(),
+            "rules": [{"id": a.id, "ver": a.ver, "layer": a.layer, "text": a.rule.text()} for a in executor.in_force()[0]],
+            "transport": "http" if _http else "stdio", "limits_mode": V1["limits"]}
+
+
+@lru_cache(maxsize=1)
+def code_id() -> str:
+    """The code being served: a hash of the package's Python files (a checkout has no version control)."""
+    root = Path(__file__).resolve().parents[1]
+    h = hashlib.sha256()
+    for f in sorted(root.rglob("*.py")):
+        h.update(str(f.relative_to(root)).encode() + b"\0" + f.read_bytes())
+    return h.hexdigest()[:12]
+
+
+def switch_values() -> dict[str, Any]:
+    """TGLW_ and TGL_ variables set in the environment, and what the switch tables hold."""
+    from tglw.views import api
+    from tglw.views.switches import V1 as views_v1
+    return {"env": {k: v for k, v in sorted(os.environ.items()) if k.startswith(("TGLW_", "TGL_"))},
+            "server.M8": dict(M8), "server.V1": dict(V1), "views.M6": dict(api.M6), "views.M8": dict(api.M8),
+            "views.V1": dict(views_v1), "figures": {k: on for k, _, on in figures.switches.table()}}
 
 
 @dataclass(frozen=True)
@@ -187,15 +377,22 @@ def _send(text: str, lim: Limits) -> str | list[str]:
     text = _fit(text, lim)
     if lim.part is None or _utf16(text) <= lim.part:
         return text
-    return _parts(text, lim.part)
+    parts = _parts(text, lim.part)
+    report(record.dec, "split", src="limits", parts=len(parts), limit=lim.part)
+    return parts
 
 
-def _shrink(make: Callable[[int], str], budget: int, lim: Limits, floor: int) -> str:
-    """make(budget), with the budget lowered until the result fits the client's total bytes."""
+def _shrink(make: Callable[[int], str], budget: int, lim: Limits, floor: int, unit: str = "chars") -> str:
+    """make(budget), with the budget lowered until the result fits the client's total bytes (a trace keeps only the
+    last try, and the lowering)."""
+    first, mark = budget, record.mark()
     text = make(budget)
     while lim.total is not None and (size := len(text.encode())) > lim.total - 200 and budget > floor:
         budget = max(floor, budget * (lim.total - 200) // size)
+        record.rewind(mark)
         text = make(budget)
+    if budget != first:
+        report(record.dec, "shrink", src="limits", unit=unit, **{"from": first, "to": budget})
     return text
 
 
@@ -228,9 +425,11 @@ def render_result(text: str) -> str:
 def _doc(doc: str) -> str:
     _refresh()
     try:
-        return tools.resolve_doc(doc)
+        name = tools.resolve_doc(doc)
     except tools.LookupFailed as err:
         raise ToolError(str(err)) from err
+    report(record.doc, name)
+    return name
 
 
 _library = [tools.registry.stamp()]  # the library the caches were filled from
@@ -260,14 +459,18 @@ def _mark_seen(name: str, text: str, s: Session) -> str:
         return text
     seen = s.seen.setdefault(name, set())
     out = []
+    marked = 0
     for line in text.splitlines():
         m = _HIT.match(line)
         if m and m.group(4) and not line.startswith("section number"):
             key = f"{m.group(2)}{m.group(4)}"
             if key in seen:
                 line = f"{m.group(1)}{m.group(2)}{m.group(3)} | (seen)"
+                marked += 1
             seen.add(key)
         out.append(line)
+    if marked:
+        report(record.dec, "seen_marks", src="M8.seen", n=marked)
     return "\n".join(out)
 
 
@@ -279,11 +482,13 @@ def _fit(text: str, lim: Limits | None = None) -> str:
     if len(text) <= cap:
         return text
     cut = text.rfind("\n", 0, cap - 200)
+    report(record.sig, "cut", at_chars=cut, why="client" if cap < CHAR_CAP else "chars")
     return text[:cut] + "\n[cut: output too long for one call; ask for fewer addresses or a smaller max_tokens]"
 
 
 @server.tool(description="List documents (only needed when no document is named): name, pages, tokens, structure.",
              structured_output=False)
+@_traced
 def list_documents(filter: Annotated[str, _or("")] = "", ctx: Context | None = None) -> str | list[str]:
     _refresh()
     try:
@@ -294,6 +499,7 @@ def list_documents(filter: Annotated[str, _or("")] = "", ctx: Context | None = N
 
 @server.tool(description="Section outline: id, title, PDF pages (printed), tokens. section: expand one id.",
              structured_output=False)
+@_traced
 def outline(doc: str, depth: Annotated[int, _or(2)] = 2, section: str | None = None,
             ctx: Context | None = None) -> str | list[str]:
     name = _doc(doc)
@@ -311,30 +517,58 @@ def _qc_header(name: str, text: str) -> str:
     if verdict is None:
         return text
     head, sep, rest = text.partition("\n")
-    return re.sub(r" · sidecars: .*$", f" · {verdict}", head) + sep + rest
+    new = re.sub(r" · sidecars: .*$", f" · {verdict}", head)
+    if new != head:
+        guarded(_trace_qc_header, verdict, head, new)
+    return new + sep + rest
+
+
+def _trace_qc_header(verdict: str, head: str, new: str) -> None:
+    report(record.sig, "qc", verdict=verdict)
+    report(record.dec, "qc_notes", src="TGLW_ING_QC_NOTES", tokens=count_tokens(new) - count_tokens(head))
 
 
 @server.tool(description=_description("read"), structured_output=False)
+@_traced
 def read(doc: str, addrs: Annotated[list[str], BeforeValidator(_lenient_list)],
          max_tokens: Annotated[int, _or(READ_CAP)] = READ_CAP, ctx: Context | None = None) -> str | list[str]:
     runs = _runs(doc, addrs)
     s, lim = _session(ctx), _limits(ctx)
     budget = max(200, min(max_tokens, READ_CAP))
     chars = READ_CHARS if lim.total is None else min(READ_CHARS, lim.total - 2_000)
+    if chars != READ_CHARS:
+        report(record.dec, "shrink", src="limits", unit="chars", **{"from": READ_CHARS, "to": chars})
+    images: list[Any] = []
     if len(runs) == 1:
         name, run = runs[0]
         text = _shrink(lambda c: _read_one(name, run, budget, c, s), chars, lim, 2_000)
+        if executor.on():
+            text, images = _rules(executor.after_read, (text, []), name, text, s, lim)
         s.pages.setdefault(name, set()).update(_delivered(text))
     else:
         text = _shrink(lambda c: _read_runs(runs, budget, c, s), chars, lim, 2_000)
         for name, part in _parts_by_doc(text):
             s.pages.setdefault(name, set()).update(_delivered(part))
-    return _send(text, lim)
+    sent = _send(text, lim)
+    return [*([sent] if isinstance(sent, str) else sent), *images] if images else sent
 
 
-def _read_one(name: str, addrs: list[str], budget: int, chars: int, s: Session) -> str:
-    text = views.read(name, addrs, max_tokens=budget, max_chars=chars, grow=M8["m6_next_page"] or not M8["adjacent_pages"])
-    text = _adjacent(name, text, budget, s, chars) if M8["adjacent_pages"] else text
+def _rules(fn: Callable[..., Any], unchanged: Any, *args: Any) -> Any:
+    """What the rules in effect make of a return (executor); an error there leaves it unchanged, counted as lost."""
+    try:
+        return fn(*args)
+    except Exception:  # noqa: BLE001 - rules never fail a tool call
+        lost("error:rules")
+        return unchanged
+
+
+def _read_one(name: str, addrs: list[str], budget: int, chars: int, s: Session, adjacent: bool = True,
+              grow: bool | None = None, page_context: bool = True) -> str:
+    """One document's read as the model gets it; a rule's reading turns off M8's adjacent pages (adjacent), M6's
+    next page (grow) and, reading on after a cut, M6's same page (page_context)."""
+    grow = M8["m6_next_page"] or not M8["adjacent_pages"] if grow is None else grow
+    text = views.read(name, addrs, max_tokens=budget, max_chars=chars, grow=grow, page_context=page_context)
+    text = _adjacent(name, text, budget, s, chars) if M8["adjacent_pages"] and adjacent else text
     with tools.PDFIUM:  # task VIS: figure lines, drawing hints, scanned-page marks
         text = figures.annotate.read(name, text, addrs)
     return _qc_pages(name, text)
@@ -351,11 +585,21 @@ def _qc_pages(name: str, text: str) -> str:
     if not suspects:
         return text
     out = []
+    flagged: list[int] = []
     for line in text.split("\n"):
         out.append(line)
         if (m := _PAGE_HEAD.match(line)) and int(m.group(1)) in suspects:
             out.append(f"[ingest QC flags p{m.group(1)}: {'; '.join(suspects[int(m.group(1))])}]")
+            flagged.append(int(m.group(1)))
+    if flagged:
+        guarded(_trace_qc_pages, flagged, suspects)
     return "\n".join(out)
+
+
+def _trace_qc_pages(flagged: list[int], suspects: dict[int, list[str]]) -> None:
+    report(record.sig, "qc", pages=flagged, why=sorted({w.split(" ")[0] for p in flagged for w in suspects[p]}))
+    report(record.dec, "qc_notes", src="TGLW_ING_QC_NOTES",
+               tokens=sum(count_tokens(f"[ingest QC flags p{p}: {'; '.join(suspects[p])}]") for p in flagged))
 
 
 _PAGE_HEAD = re.compile(r"^== p(\d+)\b")
@@ -372,9 +616,12 @@ def _runs(doc: str, addrs: list[str]) -> list[tuple[str, list[str]]]:
     from tglw import corpus
     _refresh()
     try:
-        return corpus.group_addrs(addrs, default=None if doc.strip() == "*" else _doc(doc), names=tools.allowed_docs())
+        runs = corpus.group_addrs(addrs, default=None if doc.strip() == "*" else _doc(doc), names=tools.allowed_docs())
     except corpus.DocAddrError as err:
         raise ToolError(str(err)) from err
+    names = list(dict.fromkeys(name for name, _ in runs))
+    report(record.doc, names if len(names) > 1 else names[0] if names else doc)
+    return runs
 
 
 def _read_runs(runs: list[tuple[str, list[str]]], budget: int, chars: int, s: Session) -> str:
@@ -386,6 +633,8 @@ def _read_runs(runs: list[tuple[str, list[str]]], budget: int, chars: int, s: Se
         head = DOC_HEAD.format(name)
         if budget - used < 200 or chars - used_chars < 2_000:
             out.append("next: " + ", ".join(f"{n}:{a}" for n, run in runs[i:] for a in run))
+            report(record.sig, "next", rest=[f"{n}:{a}" for n, run in runs[i:] for a in run],
+                       why="budget" if budget - used < 200 else "chars")
             break
         text = _read_one(name, addrs, budget - used, chars - used_chars - len(head) - 1, s)
         lines = text.split("\n")
@@ -419,6 +668,7 @@ def _one_doc(doc: str, addr: str) -> tuple[str, str]:
         except corpus.DocAddrError as err:
             raise ToolError(str(err)) from err
         if named:
+            report(record.doc, named)
             return named, rest
     return _doc(doc), addr
 
@@ -454,35 +704,52 @@ def _adjacent(name: str, text: str, budget: int, s: Session, max_chars: int = RE
     cand = [p for p in dict.fromkeys([b + 1 for _, b in runs] + [a - 1 for a, _ in runs])
             if 1 <= p <= last and p not in shown and p in pool]
     used, chars, extra = count_tokens(text), len(text), []
+    kept, page_tokens = [], 0
     for p in sorted(cand):
+        mark = record.mark()
         page = views.read(name, [f"p{p}"], max_tokens=max(1, budget - used), max_chars=max_chars - chars, grow=False)
         if not page.strip() or page.splitlines()[-1].startswith("next: ") or page.startswith("[note]"):
+            record.rewind(mark)
             continue  # does not fit whole
+        record.rewind(mark, kinds=("addr",))  # what it shows and signals stays; the address is the tool's
         extra.append(page)
-        used += count_tokens(page)
+        tokens = count_tokens(page)
+        used += tokens
+        page_tokens += tokens
         chars += len(page) + 1
+        kept.append(p)
     if not extra:
         return text
     added = _delivered("\n".join(extra))
+    dropped = None
     if (m := re.match(r"continues: p(\d+) ", lines[-1])) and int(m.group(1)) in added:
         lines = lines[:-1]  # the page it points to follows
+        dropped = int(m.group(1))
+    guarded(_trace_adjacent, kept, page_tokens, dropped, len(s.queries[name]))
     return "\n".join(lines + [ADJACENT_NOTE] + extra)
+
+
+def _trace_adjacent(pages: list[int], page_tokens: int, dropped: int | None, queries: int) -> None:
+    report(record.dec, "adjacent", src="M8.adjacent_pages", pages=pages, tokens=page_tokens + count_tokens(ADJACENT_NOTE),
+               dropped_continues=dropped, why={"queries": queries, "rank_pool": ADJACENT_TOP})
 
 
 @server.tool(description="Context of an address: section path, table parts, parent opening, siblings, references "
                          "in and out, terms, footnotes.",
              structured_output=False)
+@_traced
 def context(doc: str, addr: str, max_tokens: Annotated[int, _or(1500)] = 1500, part: str | None = None,
             ctx: Context | None = None) -> str | list[str]:
     name, addr = _one_doc(doc, addr)
     s, lim = _session(ctx), _limits(ctx)
     text = _shrink(lambda tokens: view_context(name, addr, max_tokens=tokens, part=part),
-                   max(200, min(max_tokens, CONTEXT_CAP)), lim, 200)
+                   max(200, min(max_tokens, CONTEXT_CAP)), lim, 200, unit="tokens")
     s.pages.setdefault(name, set()).update(_delivered(text))
     return _send(text, lim)
 
 
 @server.tool(description=_description("search"), structured_output=False)
+@_traced
 def search(doc: str, query: str, k: Annotated[int, _or(5)] = 5, unit: Annotated[str, _or("block")] = "block",
            mode: Annotated[str, _or("bm25")] = "bm25", offset: Annotated[int, _or(0)] = 0,
            ctx: Context | None = None) -> str | list[str]:
@@ -491,6 +758,7 @@ def search(doc: str, query: str, k: Annotated[int, _or(5)] = 5, unit: Annotated[
     if mode not in ("bm25", "literal") and not (mode == "list" and V1["list"]):
         raise ToolError("mode must be 'bm25' or 'literal'" + (" or 'list'" if V1["list"] else ""))
     s = _session(ctx)
+    s.searches += 1
     if doc.strip() == "*" and V1["library"]:
         return _send(_library_search(query, min(k, SEARCH_K_CAP), unit, mode, s), _limits(ctx))
     name = _doc(doc)
@@ -498,10 +766,16 @@ def search(doc: str, query: str, k: Annotated[int, _or(5)] = 5, unit: Annotated[
         from tglw.corpus.listing import list_literal
         return _send(list_literal(name, query, offset=max(0, offset)), _limits(ctx))
     text = views.search(name, query, k=min(k, SEARCH_K_CAP), unit=unit, mode=mode)
+    if mode == "literal":
+        s.literal.setdefault(name, []).append(query)
     if mode == "bm25":
         s.queries.setdefault(name, []).append(query)
         text = _saturation(name, text, s)
-    return _send(_mark_seen(name, text, s), _limits(ctx))
+    text = _mark_seen(name, text, s)
+    guarded(executor.remember_hits, s, name)
+    if executor.on():
+        text = _rules(executor.after_search, text, name, query, mode, text, s, _limits(ctx))
+    return _send(text, _limits(ctx))
 
 
 def _library_search(query: str, k: int, unit: str, mode: str, s: Session) -> str:
@@ -531,13 +805,20 @@ def _saturation(name: str, text: str, s: Session) -> str:
     again = sum(h in listed for h in hits)
     listed.update(hits)
     if M8["saturation_hint"] and hits and again / len(hits) >= SATURATED:
+        guarded(_trace_saturation, again, len(hits))
         return text + "\n" + SATURATION_NOTE
     return text
+
+
+def _trace_saturation(again: int, hits: int) -> None:
+    report(record.sig, "saturated", again=again, hits=hits)
+    report(record.dec, "saturation_note", src="M8.saturation_hint", tokens=count_tokens(SATURATION_NOTE))
 
 
 @server.tool(description=figures.cost.region_description(
     "Image and text layer of tab4/fig5/t123 or box 'p45:l,t,r,b' (pt, origin bottom-left); "
     "'p45' whole page; preview=true: coordinates only. Images are costly."), structured_output=False)
+@_traced
 def region(doc: str, target: str, scale: Annotated[float, _or(tools.REGION_SCALE)] = tools.REGION_SCALE,
            preview: Annotated[bool, _or(False)] = False, ctx: Context | None = None) -> Any:
     lim = _limits(ctx)
@@ -550,8 +831,63 @@ def region(doc: str, target: str, scale: Annotated[float, _or(tools.REGION_SCALE
             r = figures_region.region(name, target, scale=None if auto else min(max(scale, 0.5), 3.0))
     except tools.LookupFailed as err:
         raise ToolError(str(err)) from err
-    text = _send(f"{r.caption}\n{r.text}", lim)
+    s = _session(ctx)
+    guarded(executor.remember_image, s, name, target)
+    note = ""
+    if executor.on():
+        r, note = _rules(executor.after_region, (r, ""), name, target, scale == tools.REGION_SCALE, r, s, lim)
+    text = _send(f"{r.caption}\n{r.text}" + (f"\n{note}" if note else ""), lim)
     return [*([text] if isinstance(text, str) else text), Image(data=r.png, format="png")]
+
+
+def trace(last: Annotated[int, _or(1)] = 1, ignored: Annotated[bool, _or(False)] = False,
+          help: Annotated[bool, _or(False)] = False, doc: Annotated[str, _or("")] = "", ctx: Context | None = None) -> str | list[str]:
+    """The last readings recorded on this machine (each conversation one reading), newest first, in the reading
+    language; not itself a reading step, so not recorded."""
+    from tglw.trace import lang, query
+    with record.quiet():
+        if help:
+            return _send(lang.HELP, _limits(ctx))
+        name = None
+        if doc.strip():
+            try:
+                name = tools.resolve_doc(doc)
+            except tools.LookupFailed:
+                name = doc.strip()  # a document no longer in the library can still have readings
+        try:
+            text = query.show(last=min(max(1, last), TRACE_LAST_CAP), ignored=ignored, doc=name)
+        except Exception as err:  # noqa: BLE001 - an unreadable trace store is the call's error, not the server's
+            raise ToolError(f"recorded readings could not be read: {err}") from err
+        return _send(text, _limits(ctx))
+
+
+if TOOL_SWITCHES["trace_tool"]:
+    from tglw.trace import lang as _lang
+    server.tool(description=_lang.TRACE_TOOL_DESCRIPTION + " doc: that document's readings only.",
+                structured_output=False)(trace)
+
+RULES_DESCRIPTION = ("Rules the tools carry out on every reading: action=list|add|change|delete|on|off|undo|reset|"
+                     "all-off|history|preview|help; text: a rule or its id; why: what the user asked for.")
+
+
+def rules(action: str, text: Annotated[str, _or("")] = "", why: Annotated[str, _or("")] = "",
+          ctx: Context | None = None) -> str | list[str]:
+    """The reading rules (rules_tool): list, add, change, delete, switch, undo, reset, preview; a rule written wrong or
+    a change refused is the call's error, saying how to fix it."""
+    from . import rules_tool
+    try:
+        out = rules_tool.run(action, text, why)
+    except rules_tool.Refused as err:
+        s = _session(ctx)
+        quick = rules_tool.quick(err) if not s.quick_shown else ""
+        s.quick_shown = s.quick_shown or bool(quick)
+        raise ToolError(str(err) + (f"\n\n{quick}" if quick else "")) from err
+    return _send(out, _limits(ctx))
+
+
+if TOOL_SWITCHES["rules_tool"]:
+    from tglw.trace import lang as _lang
+    server.tool(description=getattr(_lang, "RULES_TOOL_DESCRIPTION", RULES_DESCRIPTION), structured_output=False)(_traced(rules))
 
 
 def _strip_titles(schema: Any) -> Any:
@@ -628,6 +964,9 @@ def main(argv: list[str] | None = None) -> int | None:
                     help="also take MCP 2026-07-28 requests; they carry no session, so for such clients nothing is kept "
                          "between calls (no adjacent pages, no saturation hint)")
     a = ap.parse_args(argv)
+    from tglw.store import traces
+    record.set_sink(traces.append)
+    atexit.register(record.end)
     if not a.http:
         server.run()
         return
@@ -636,7 +975,8 @@ def main(argv: list[str] | None = None) -> int | None:
     global _http
     _http = True
     t0 = time.perf_counter()
-    names = preload(a.preload)
+    with record.quiet():  # not a reading
+        names = preload(a.preload)
     app = server.streamable_http_app(host=a.host)
     print(f"{COMMAND} mcp: {len(names)} documents loaded in {time.perf_counter() - t0:.1f} s; "
           f"serving http://{a.host}:{a.port}/mcp", file=sys.stderr, flush=True)

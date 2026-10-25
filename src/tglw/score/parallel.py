@@ -11,13 +11,16 @@ parallelism. Records mirror it under <records> (`<records>/<sub>/lane<i>/`); `pl
 `run_parallel` gives each lane its own thread and config directory (`<config>-<i>`) and goes through
 its share of the schedule, calling `headless.run_batch` for one run at a time (all its checks apply),
 with the pause kept per lane. A shared stop file `<records>/STOP` stops every lane: any lane writes it
-when its run stops the batch or anything else goes wrong, and each lane looks for it before starting a
-run, so the others stop before their next one. Permission denials are recorded, not stopped on. Every
-stop is logged in `<records>/stops.log`; a new start is refused while STOP is there, within an hour of
-the last stop, and after two stops (then the user decides). Failed runs are left for a person, except
-that with `retry_infra` an infrastructure failure (an API error that stopped the batch, a crash, an
-error result, no session log) gets one more attempt with the same material (`plan.retry`); a run that
-failed by itself (timeout, turn limit, no answer text) is never rerun.
+when its run stops the batch (an API limit, a session that differs from its condition), after
+INFRA_STREAK infrastructure failures in a row, or when anything else goes wrong, and each lane looks
+for it before starting a run, so the others stop before their next one. Permission denials are
+recorded, not stopped on; an infrastructure failure (an API error other than a limit, a crash, an
+error result, no session log) fails only its run. Every stop is logged in `<records>/stops.log`; a new
+start is refused while STOP is there, and after a stop on an API limit (429, 403, abuse:
+`headless.is_limit`, tagged LIMIT_TAG) also within an hour of it and after two of them (then the user
+decides; PREREG_G4 section 4). Failed runs are left for a person, except that with `retry_infra` an
+infrastructure failure gets one more attempt with the same material (`plan.retry`); a run that failed
+by itself (timeout, turn limit, no answer text) is never rerun.
 """
 
 from __future__ import annotations
@@ -37,9 +40,10 @@ from . import headless, plan, settings
 from .questions import Question
 
 SCHEDULE_COLUMNS = ("seq", "lane", "substage", "run_id", "condition", "question_id")
-RUN_FAILURES = ("timeout after", "max turns reached", "no answer text")  # the run's own failures: never rerun
-WAIT_AFTER_STOP = 3600
-MAX_STOPS = 2
+RUN_FAILURES = headless.RUN_FAILURES
+WAIT_AFTER_STOP = 3600  # after a stop on an API limit
+MAX_STOPS = 2  # stops on an API limit
+LIMIT_TAG = "[API limit]"
 
 
 @dataclass(frozen=True)
@@ -168,13 +172,16 @@ def refusal(dest: Path, records: Path, configs: dict[int, Path], now: float) -> 
         if not (cfg / "settings.json").is_file():
             return f"lane {lane}: {cfg}/settings.json is missing (copy it from ~/.claude before starting)"
     if (records / "STOP").exists():
-        return (f"{records / 'STOP'} is set: {(records / 'STOP').read_text().strip()}; after waiting at least "
-                f"{WAIT_AFTER_STOP // 3600} hour, delete it to go on")
-    past = stops(records)
+        line = (records / "STOP").read_text().strip()
+        then = f"after waiting at least {WAIT_AFTER_STOP // 3600} hour" if LIMIT_TAG in line else "after a look"
+        return f"{records / 'STOP'} is set: {line}; {then}, delete it to go on"
+    past = [s for s in stops(records) if LIMIT_TAG in s[1]]
     if len(past) >= MAX_STOPS:
-        return f"the batch has stopped {len(past)} times (see {records / 'stops.log'}); the user decides how to go on"
+        return (f"the batch has stopped {len(past)} times on an API limit (see {records / 'stops.log'}); "
+                "the user decides how to go on")
     if past and now - past[-1][0] < WAIT_AFTER_STOP:
-        return f"the last stop was at {_iso(past[-1][0])}; wait until {_iso(past[-1][0] + WAIT_AFTER_STOP)}"
+        return (f"the last stop on an API limit was at {_iso(past[-1][0])}; "
+                f"wait until {_iso(past[-1][0] + WAIT_AFTER_STOP)}")
     return ""
 
 
@@ -195,13 +202,21 @@ def state(rec: Path, item: dict[str, str]) -> str:
     return "failed" if any(f in tries[-1]["reason"] for f in RUN_FAILURES) else "infra"
 
 
+def _stopped(rec: Path) -> str:
+    """Why the run in `rec` stopped the batch, from its meta.json, or ""."""
+    try:
+        return json.loads((rec / "meta.json").read_text()).get("stopped_batch") or ""
+    except (OSError, ValueError):
+        return ""
+
+
 def run_lane(dest: Path, records: Path, lane: int, items: Sequence[dict[str, str]], config_dir: Path, *,
              pause: float, timeout: float, max_turns: int, claude: str, allow_frozen: bool,
              out: Callable[[str], None], sleep: Callable[[float], None], retry_infra: bool = False) -> int:
     """One lane: its share of the schedule, one run at a time; 0 done, otherwise the batch stopped."""
     stop_file = records / "STOP"
     last = records / f"lane{lane}.last_end"
-    left = []
+    left, streak = [], 0
     for item in items:
         sub, rid = item["substage"], item["run_id"]
         sub_dest, sub_rec = dest / sub / f"lane{lane}", records / sub / f"lane{lane}"
@@ -230,8 +245,18 @@ def run_lane(dest: Path, records: Path, lane: int, items: Sequence[dict[str, str
                                 model=model, stop_on_denials=False, out=lambda s: out(f"{sub}: {s}"), sleep=sleep)
         last.write_text(f"{time.time()} {sub}/{rid}\n")
         if rc != 0:
-            halt(stop_file, f"lane {lane}: {sub}/{rid} stopped the batch (runner code {rc})")
+            why = _stopped(sub_rec / rid) or f"runner code {rc}"
+            tag = f" {LIMIT_TAG}" if headless.is_limit(why) else ""
+            halt(stop_file, f"lane {lane}: {sub}/{rid} stopped the batch{tag}: {why}")
             return rc
+        if state(sub_rec, item) != "infra":
+            streak = 0
+            continue
+        left.append(f"{sub}/{rid} (infrastructure)")
+        streak += 1
+        if streak >= headless.INFRA_STREAK:
+            halt(stop_file, f"lane {lane}: {streak} infrastructure failures in a row, the last {sub}/{rid}")
+            return 2
     if left:
         out("left for a person (failed; not rerun): " + ", ".join(left))
     return 0

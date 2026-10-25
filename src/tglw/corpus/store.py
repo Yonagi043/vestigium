@@ -84,17 +84,25 @@ def index_meta() -> dict[str, str]:
     from tglw.zh import FOLD_AVAILABLE
 
     return {"schema": str(SCHEMA), "cjk": CJK, "fold_tables": "opencc" if FOLD_AVAILABLE else "nfkc-only",
-            "running_headers": "split" if _on(g_index.RUNNING_HEADERS_ENV) else "off"}
+            "running_headers": "split" if _on(g_index.RUNNING_HEADERS_ENV) else "off",
+            "table_rows": "text" if _on(g_index.TABLE_ROWS_ENV) else "off"}
 
 
 def _on(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "on", "yes")
 
 
-def mismatch(con: sqlite3.Connection) -> dict[str, tuple[str | None, str]]:
-    """Settings the index was built with that differ from this process's: key -> (index, here)."""
-    have = dict(con.execute("SELECT key, value FROM meta"))
+ADDED_SETTINGS = {"running_headers": "off", "table_rows": "off"}  # an index built before a setting existed has it off
+
+
+def differs(meta: dict[str, str]) -> dict[str, tuple[str | None, str]]:
+    """Settings an index's meta was built with that differ from this process's: key -> (index, here)."""
+    have = {**ADDED_SETTINGS, **meta}
     return {k: (have.get(k), v) for k, v in index_meta().items() if have.get(k) != v}
+
+
+def mismatch(con: sqlite3.Connection) -> dict[str, tuple[str | None, str]]:
+    return differs(dict(con.execute("SELECT key, value FROM meta")))
 
 
 def _reset(con: sqlite3.Connection) -> None:
@@ -143,9 +151,10 @@ def _sidecar_path(task: str, suffix: str, name: str) -> Path | None:
 
 
 def sources(name: str) -> dict[str, Any]:
-    """What a document's rows are built from: its bundle and the A (sections) and B (page labels) sidecars."""
-    return {"bundle": registry.get(name).sha256,
-            **{t: _digest(_sidecar_path(t, s, name)) for t, s in (("A", ".structure.json"), ("B", ".pagemap.json"))}}
+    """What a document's rows are built from: its bundle, the A (sections) and B (page labels) sidecars,
+    and with TGLW_SRC_TABLE_ROWS on, task TR's table rows."""
+    side = [("A", ".structure.json"), ("B", ".pagemap.json")] + ([("TR", ".tablerows.json")] if _on(g_index.TABLE_ROWS_ENV) else [])
+    return {"bundle": registry.get(name).sha256, **{t: _digest(_sidecar_path(t, s, name)) for t, s in side}}
 
 
 def _section_rows(name: str) -> list[tuple[str, str, str | None, str, int]]:

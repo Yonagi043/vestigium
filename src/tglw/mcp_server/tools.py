@@ -20,8 +20,10 @@ import pypdfium2.raw as pdfium_c
 from tglw.common import registry
 from tglw.common.paths import DATA
 from tglw.common.text import count_tokens
+from tglw.trace import record
 from tglw.views import view
 from tglw.views.docview import long_ref, short_ref
+from tglw.views.tracing import guarded, report
 
 REGION_SCALE = 1.5
 MAX_SIDE = 1200
@@ -84,7 +86,7 @@ def list_documents(filter: str = "", qc: bool = False) -> str:
     """One line per document; with qc, the verdict of its ingest quality report (task ING) when it has one."""
     idx = doc_index()
     allow = allowed_docs()
-    lines = []
+    lines, names, verdicts = [], [], {}
     for d in registry.docs():
         if allow is not None and d.name not in allow:
             continue
@@ -98,8 +100,18 @@ def list_documents(filter: str = "", qc: bool = False) -> str:
             from tglw.ingest import qc as ingest_qc
             verdict = ingest_qc.summary(d.name)
             extra += f" · {verdict}" if verdict else ""
+            verdicts.update({d.name: verdict} if verdict else {})
         lines.append(f"{d.name} · {d.cls} · {d.pages} p · {size} · structure {r.get('structure', '?')}{extra}")
+        names.append(d.name)
+    report(record.sig, "struct", part="documents", units=names, n=len(names))
+    if verdicts:
+        guarded(_trace_verdicts, verdicts)
     return "\n".join(lines) if lines else f"no document matches {filter!r}"
+
+
+def _trace_verdicts(verdicts: dict[str, str]) -> None:
+    report(record.sig, "qc", docs=verdicts)
+    report(record.dec, "qc_notes", src="TGLW_ING_QC_NOTES", tokens=sum(count_tokens(f" · {v}") for v in verdicts.values()))
 
 
 @dataclass
@@ -183,8 +195,10 @@ def _target_box(name: str, target: str) -> tuple[int, Box | None, str]:
         if not 1 <= page <= v.doc.page_count:
             raise LookupFailed(f"page out of range: {target!r} (1-{v.doc.page_count})")
         if not m.group("box"):
+            report(record.addr, target, kind="page", pages=[page])
             return page, None, f"p{page} whole page"
         l, a, r, b = (float(x) for x in m.group("box").split(","))
+        report(record.addr, target, kind="box", pages=[page])
         return page, (min(l, r) - PAD, max(a, b) + PAD, max(l, r) + PAD, min(a, b) - PAD), target
     ref = long_ref(target.strip())
     block = v.doc.by_ref.get(ref) if ref else None
@@ -192,6 +206,7 @@ def _target_box(name: str, target: str) -> tuple[int, Box | None, str]:
         raise LookupFailed(f"bad region target {target!r}: use a block id (tab4, fig5, t123), "
                            "a page box 'p45:l,t,r,b' (PDF points, origin bottom-left), or 'p45' for a whole page")
     note = f" (first of pages {block.pages[0]}-{block.pages[-1]})" if len(block.pages) > 1 else ""
+    report(record.addr, target, kind={"table": "table", "picture": "figure"}.get(block.kind, "block"), pages=[block.page])
     return block.page, block_box(v, block)[0], f"{target}{note}"
 
 
@@ -209,7 +224,7 @@ def preview(doc: str, target: str) -> str:
     l0, t0, r0, b0 = box or (0.0, size["height"], size["width"], 0.0)
     lines = [f"{label} · {v.page_tag(page)} · page {size['width']:.0f}×{size['height']:.0f} pt · "
              f"box {l0:.0f},{t0:.0f},{r0:.0f},{b0:.0f} (l,t,r,b; origin bottom-left)"]
-    rows = []
+    rows, refs = [], []
     for b in v.by_page.get(page, []):
         if b.bbox is None or not v.visible(b, page) or b.page != page:
             continue
@@ -218,6 +233,8 @@ def preview(doc: str, target: str) -> str:
             continue
         words = " ".join(b.text.split()[:PREVIEW_WORDS])
         rows.append(f"{short_ref(b.ref)} {b.label} {l:.0f},{t:.0f},{r:.0f},{bot:.0f} {words}")
+        refs.append(short_ref(b.ref))
+    report(record.sig, "struct", part="preview", units=refs[:PREVIEW_BLOCKS], n=len(refs), page=page)
     lines += rows[:PREVIEW_BLOCKS] + ([f"… +{len(rows) - PREVIEW_BLOCKS} more"] if len(rows) > PREVIEW_BLOCKS else [])
     return "\n".join(lines)
 

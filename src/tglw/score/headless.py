@@ -9,10 +9,14 @@ protocol asks of the operator: T allows its six `tgl` tools explicitly; P and W 
 directory, which Claude Code allows without a prompt, and anything else is refused.
 
 stdout is saved as it arrives and watched: an API retry (Claude Code retries 429, 403, 5xx and
-network errors), a rate-limit warning or an "API Error" message kills the run and stops the batch.
-After a run the batch also stops on an error result, a crash, a missing session log, a permission
-denial, API trouble on stderr, or a session whose tools or MCP servers differ from the condition,
-so that a person looks first. A run over the timeout is killed and recorded as failed; nothing is rerun automatically.
+network errors), a rate-limit warning or an "API Error" message kills the run. A limit (429, 403,
+abuse, rate limit, quota: `is_limit`), in the stream, an error result or on stderr, also stops the
+batch. Other API trouble (an unknown retry, a 5xx), a crash, an error result or a missing session
+log fails only that run, as an infrastructure failure (`infra_failure`; the parallel runner's
+--retry-infra gives it one more attempt), and the batch goes on, unless INFRA_STREAK of them come in
+a row (the service may be down). The batch also stops on a permission denial or a session whose
+tools or MCP servers differ from the condition, so that a person looks first. A run over the timeout
+is killed and recorded as failed; nothing is rerun automatically.
 
 Records of a run (`<records>/<run_id>/`): stdout.jsonl and stderr.txt as received; session.jsonl and
 session/ (the session log, found by its id under ~/.claude/projects and checked against the run
@@ -42,20 +46,30 @@ from tglw import COMMAND
 from . import answer, audit, plan, settings
 
 TGL_TOOLS = ("list_documents", "outline", "read", "context", "search", "region")
+EXTRA_TOOLS = ("trace", "rules")  # T allows them; only a server that has them on offers them
 SHELL_TOOLS = ("Read", "Grep", "Glob")
 FLAGS = {
     "T": ["--strict-mcp-config", "--mcp-config", ".mcp.json", "--tools", "",
-          "--allowedTools", ",".join(f"mcp__tgl__{t}" for t in TGL_TOOLS)],
+          "--allowedTools", ",".join(f"mcp__tgl__{t}" for t in TGL_TOOLS + EXTRA_TOOLS)],
     "P": ["--strict-mcp-config", "--tools", ",".join(SHELL_TOOLS)],
     "W": ["--strict-mcp-config", "--tools", ",".join(SHELL_TOOLS)],
     "V": ["--strict-mcp-config", "--tools", ",".join(SHELL_TOOLS)],
     "S": ["--strict-mcp-config", "--tools", ",".join(SHELL_TOOLS)],
+    # R: questions about a recorded reading, answered with the trace tool alone
+    "R": ["--strict-mcp-config", "--mcp-config", ".mcp.json", "--tools", "", "--allowedTools", "mcp__tgl__trace",
+          "--disallowedTools", ",".join(f"mcp__tgl__{t}" for t in TGL_TOOLS)],
+    # U: a user's request written as a rule, with the rules tool alone
+    "U": ["--strict-mcp-config", "--mcp-config", ".mcp.json", "--tools", "", "--allowedTools", "mcp__tgl__rules",
+          "--disallowedTools", ",".join(f"mcp__tgl__{t}" for t in TGL_TOOLS + ("trace",))],
 }
 # The launch scripts' list, plus what a parent Claude Code session exports to its shells (the
 # runner may be started from one) and PYTHONPATH (T's server sets its own in .mcp.json).
 CLEAR = re.compile(r"CLAUDE_CODE_\w*|CLAUDECODE|CLAUDE_BRIDGE_\w*|VSCODE_\w*|TERM_PROGRAM|TERM_PROGRAM_VERSION|"
                    r"FORCE_CODE_TERMINAL|GIT_ASKPASS|CLAUDE_EFFORT|CLAUDE_PID|AI_AGENT|TRACEPARENT|PYTHONPATH")
 API_TROUBLE = re.compile(r"API Error|rate.?limit|\b429\b|\b403\b|quota|abuse|forbidden|overloaded", re.I)
+LIMIT = re.compile(r"\b429\b|\b403\b|rate.?limit|quota|abuse|forbidden", re.I)  # stops the batch (PREREG_G4 section 4)
+RUN_FAILURES = ("timeout after", "max turns reached", "no answer text")  # the run's own failures: never rerun
+INFRA_STREAK = 3  # infrastructure failures in a row that stop the batch anyway
 KILL_GRACE = 10
 NOTE = ("headless", "", "", "", "note", f"从这一行起是 headless 模式：{COMMAND} eval headless 自动运行"
         "（claude -p，stream-json），严格串行，两次之间至少停 --pause 秒")
@@ -80,6 +94,16 @@ def clean_env(env: dict[str, str]) -> tuple[dict[str, str], list[str]]:
 
 def _iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def is_limit(why: str) -> bool:
+    """Whether trouble is a limit (429, 403, abuse, rate limit, quota), which stops the batch."""
+    return bool(LIMIT.search(why))
+
+
+def infra_failure(status: str, reason: str) -> bool:
+    """A failed run that did not fail by itself (timeout, turn limit, no answer text)."""
+    return status == "failed" and not any(f in reason for f in RUN_FAILURES)
 
 
 def trouble(msg: dict) -> str:
@@ -198,11 +222,12 @@ def check_init(condition: str, init: dict | None) -> list[str]:
     tools = set(init.get("tools") or [])
     servers = {(s.get("name"), s.get("status")) for s in init.get("mcp_servers") or []}
     problems = []
-    if condition == "T":
+    if condition in ("T", *plan.ONLY_TOOL):
         if servers != {("tgl", "connected")}:
             problems.append(f"MCP servers {sorted(servers)}")
-        want = {f"mcp__tgl__{t}" for t in TGL_TOOLS}
-        if tools - want - audit.T_NATIVE_OK or want - tools:
+        want = {f"mcp__tgl__{t}" for t in TGL_TOOLS} if condition == "T" else {f"mcp__tgl__{plan.ONLY_TOOL[condition]}"}
+        optional = {f"mcp__tgl__{t}" for t in EXTRA_TOOLS} if condition == "T" else set()
+        if tools - want - optional - audit.T_NATIVE_OK or want - tools:
             problems.append(f"tools {sorted(tools)}")
     else:
         if servers:
@@ -298,19 +323,19 @@ def settle(o: Outcome, timeout: float, init_problems: list[str], session: Path |
     """(status, reason, why the batch stops or "")."""
     res = o.result or {}
     if o.stop:
-        return "failed", f"headless; {o.stop}", o.stop
+        return "failed", f"headless; {o.stop}", o.stop if is_limit(o.stop) else ""
     if init_problems:
         why = "session differs from the condition: " + "; ".join(init_problems)
         return "invalid", f"headless; {why}", why
     if o.timed_out:
         return "failed", f"headless; timeout after {timeout:g} s (killed)", ""
     if not res:
-        return "failed", f"headless; no result (exit code {o.exit_code})", "Claude Code ended without a result"
+        return "failed", f"headless; no result (exit code {o.exit_code})", ""
     if res.get("is_error") and res.get("subtype") != "error_max_turns":
         why = f"error result {res.get('subtype')}: {str(res.get('errors') or res.get('result') or '')[:200]}"
-        return "failed", f"headless; {why}", why
+        return "failed", f"headless; {why}", why if is_limit(why) else ""
     if session is None:
-        return "failed", "headless; session log not found", "session log not found"
+        return "failed", "headless; session log not found", ""
     if res.get("subtype") == "error_max_turns":
         return "failed", f"headless; max turns reached ({res.get('num_turns')})", ""
     if not text.strip():
@@ -367,8 +392,10 @@ def run_one(dest: Path, records: Path, row: dict[str, str], rid: str, *, timeout
     status, reason, stop = settle(o, timeout, init_problems, session, ran, text, warning, denials, stop_on_denials)
     err = next((line for line in (rec / "stderr.txt").read_text(errors="replace").splitlines()
                 if API_TROUBLE.search(line)), "")
-    if err and not stop:
+    if err and not stop and is_limit(err):
         stop = f"stderr: {err[:200]}"
+    elif err:
+        reason += f"; stderr: {err[:200]}"
 
     meta = {
         "run_id": rid, "stage": stage, "condition": cond, "question_id": qid, "attempt": attempt,
@@ -490,6 +517,7 @@ def run_batch(dest: Path, plan_file: Path, records: Path, *, only: str | None = 
     os.write(fd, f"{os.getpid()} {_iso()}\n".encode())
     os.close(fd)
     last = records / "headless_last_end"
+    streak = 0
     try:
         for n, (rid, pos) in enumerate(queue, 1):
             cond, qid, _ = plan.parse_run_id(rid)
@@ -514,6 +542,10 @@ def run_batch(dest: Path, plan_file: Path, records: Path, *, only: str | None = 
             out(f"[{n}/{len(queue)}] {rid}: {status} ({reason})")
             if stop:
                 out(f"batch stopped after {rid}: {stop}")
+                return 2
+            streak = streak + 1 if infra_failure(status, reason) else 0
+            if streak >= INFRA_STREAK:
+                out(f"batch stopped after {rid}: {streak} infrastructure failures in a row")
                 return 2
         if left:
             out(left)

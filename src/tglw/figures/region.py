@@ -11,9 +11,10 @@ import pypdfium2 as pdfium
 
 from tglw.common import registry
 from tglw.mcp_server import tools
+from tglw.trace import record
 from tglw.views import view
 
-from . import ocr, zoom
+from . import ocr, switches, tracing, zoom
 
 
 def region(doc: str, target: str, scale: float | None = None) -> tools.Region:
@@ -46,10 +47,23 @@ def region(doc: str, target: str, scale: float | None = None) -> tools.Region:
     w, h = img.size
     where = view(name).page_tag(page)
     est = round(w * h / tools.IMAGE_TOKEN_DIVISOR)
-    caption = f"{label} · {where} · {w}×{h} px · about {est} image tokens" + zoom.crop_note(page, box)
-    if text:
-        text = ocr.region_text_header(name, page, layer=True) + "\n" + text
-    else:
+    note = zoom.crop_note(page, box)
+    caption = f"{label} · {where} · {w}×{h} px · about {est} image tokens" + note
+    layer = bool(text)
+    if not layer:
         text = tools._parsed_text(name, page, box)
-        text = ocr.region_text_header(name, page, layer=False) + "\n" + text if text else "no text in the box"
+    header = ocr.region_text_header(name, page, layer=layer)
+    text = header + "\n" + text if text else "no text in the box"
+    tracing.guarded(_report_crop, page, box, (w, h), scale, est, f < 1.0, note,
+                    header if text != "no text in the box" else None, ocr.LAYER if layer else ocr.PARSED)
     return tools.Region(caption, buf.getvalue(), w, h, tools._cap(text))
+
+
+def _report_crop(page: int, box: tuple[float, ...] | None, px: tuple[int, int], scale: float, est: int, capped: bool,
+                 note: str, header: str | None, plain: str) -> None:
+    record.out(img={"page": page, "box": [round(x, 1) for x in box] if box else None, "px": list(px), "scale": scale,
+                    "img_tokens": est, "capped": capped})
+    if note:
+        record.dec("fig_hints", src=switches.env_name("CROP_BOX"), tokens=tracing.added("", note))
+    if header is not None and header != plain:
+        record.dec("scan_notes", src=switches.env_name("OCR_NOTE"), pages=[page], tokens=tracing.added(plain, header))

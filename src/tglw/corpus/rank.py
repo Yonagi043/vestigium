@@ -91,10 +91,9 @@ class Library:
     def open(cls, path: Path) -> Library:
         con = store.connect(path)
         meta = dict(con.execute("SELECT key, value FROM meta"))
-        want = store.index_meta()
-        if any(meta.get(k) != v for k, v in want.items()):
-            raise RuntimeError(f"library index {path} was built with {({k: meta.get(k) for k in want})}, this code "
-                               f"needs {want}: rebuild it (python -m tglw.corpus build)")
+        if diff := store.differs(meta):
+            raise RuntimeError(f"library index {path} was built with other settings {diff} (index, here): "
+                               "rebuild it (python -m tglw.corpus build)")
         rows = con.execute("SELECT id, doc, figure, node, heading, len_w, len_h, ord FROM units").fetchall()
         return cls(path, con, meta.get("generation", "0"), json.loads(meta.get("stats", "{}")),
                    {r[0]: r[1] for r in rows}, {r[0]: r[2] for r in rows}, {r[0]: r[3] for r in rows},

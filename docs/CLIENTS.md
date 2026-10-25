@@ -7,7 +7,7 @@ Vestigium is an MCP server. It can run in two ways:
 - **Local (stdio).** The app starts `vestigium mcp` itself, one copy per session. This is how we tested it.
 - **Long-running HTTP server.** You start `vestigium mcp --http` once; it loads documents in advance, and apps connect to a local address. This avoids the start-up delay of each new session.
 
-Only Claude Code over stdio has been tested on questions. The HTTP mode is new in this release. The other configurations follow each app's documentation and are untested.
+Only Claude Code over stdio has been tested on questions. The HTTP mode was added in 0.1.0. The other configurations follow each app's documentation and are untested.
 
 ## Claude Code (tested over stdio)
 
@@ -17,7 +17,7 @@ Only Claude Code over stdio has been tested on questions. The HTTP mode is new i
 claude mcp add --scope user --transport stdio vestigium -- vestigium mcp
 ```
 
-To pass settings, add `--env` before the name, for example `--env VESTIGIUM_HOME=/path/to/library` or `--env TGL_ALLOWED_DOCS=doc1,doc2`.
+To pass settings, add `--env` before `--transport`, one per setting, for example `claude mcp add --scope user --env VESTIGIUM_HOME=/path/to/library --env TGL_ALLOWED_DOCS=doc1,doc2 --transport stdio vestigium -- vestigium mcp`.
 
 **Shared with a project.** `--scope project` writes the server into `.mcp.json` at the project root, which you can commit:
 

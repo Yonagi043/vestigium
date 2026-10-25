@@ -6,7 +6,15 @@ Vestigium（迹）让 AI 助手像细心的分析师一样读又长又乱的 PDF
 
 [English](README.md)
 
-在 Claude Code 里实测：题目是新出的难题，材料是英文的长篇公开报告，检验方法在开跑前就写死了。
+> **0.1.1 新增**
+> - **少停早了**（默认开）：一节接到下一页还没完时，Vestigium 把下一页一起送上，AI 助手读一半就停的情况少了。
+> - **看得见是怎么读的**（可选）：每次阅读都记在你自己的机器上（设 `TGLW_TRACE=0` 可关掉）；打开 `trace` 工具，就能问 AI 助手上次是怎么读的。
+> - **告诉它以后怎么读**（可选）：打开 `rules` 工具，AI 助手可以写规则，由 Vestigium 自己执行；随时能撤销、恢复出厂。
+> - **仍然在本地**：什么都不上传。
+>
+> 实测结果（每次运行有波动）：准确率不比 0.1.0 差；花费平均低约 3%、用时平均短约 5%，都在波动范围内。详见[结果：0.1.1](docs/RESULTS_0_1_1_ZH.md)。
+
+用 0.1.0 版在 Claude Code 里实测：题目是新出的难题，材料是英文的长篇公开报告，检验方法在开跑前就写死了。
 
 - **Claude Haiku：准确率不比“把整篇全文交给模型”差，花费和用时都约一半。** 准确率 **+1.2 个点** [−1.8, +4.4]（对照组是整篇文本加 Claude Code 自带的搜索），在事先定的 5 个点界限之内；花费 **0.51**，用时 **0.54**。
 - **Claude Haiku：比直接读 PDF 准 21 个点，花费约四分之一。** **+21.2 个点** [+12.3, +30.8]；花费 **0.25**；**没有编造**（读 PDF 的那组编造了 6 处）。
@@ -72,7 +80,7 @@ search(doc="gao-26-107790", query="FEMA workforce reduction September 2025")
 
 - **编造**：用 Vestigium 和用文本文件都没有；直接读 PDF 时，判分认定有 6 个要点是编的。
 - **大模型**（Claude Opus 5.5）：27 道难题上，用 Vestigium 100%，用文本文件 99.6%。两者都到顶了，这次测试分不出高低。花费是文本文件的 0.80。
-- **这一版**：在实测版本上又加了一些功能。在 65 道开发题上用 Haiku 检查，没有退步：97.2% 对 97.1%，花费是实测版本的 0.92。差距太小，不能说这一版更好。
+- **0.1.0 发布版**：在实测版本上又加了一些功能。在 65 道开发题上用 Haiku 检查，没有退步：97.2% 对 97.1%，花费是实测版本的 0.92。差距太小，不能说发布版更好。
 
 | 你要 | 用 | 这次测试里 |
 |---|---|---|
@@ -132,9 +140,18 @@ claude mcp add --transport stdio vestigium -- vestigium mcp
 
 完整说明、地址写法和开关：[工具说明](docs/TOOLS_ZH.md)。
 
+0.1.1 加了两个可选的工具，默认关：
+
+| 工具 | 做什么 | 怎么打开 |
+|---|---|---|
+| `trace` | 用[阅读语言](docs/LANGUAGE_ZH.md)一步步写出以前的阅读是怎么走的 | `TGLW_TRACE_TOOL=1` |
+| `rules` | 列出、增加、修改、预演、撤销由工具自己执行的[规则](docs/RULES_ZH.md)；恢复出厂或全部关掉 | `TGLW_RULES_TOOL=1` |
+
+接入服务时把开关传进去，比如 `claude mcp add --env TGLW_TRACE_TOOL=1 --env TGLW_RULES_TOOL=1 --transport stdio vestigium -- vestigium mcp`。如果以前用 `--scope user` 加过，先运行 `claude mcp remove --scope user vestigium`，再带上开关和 `--scope user` 重新加。
+
 ## 能接哪些 AI 外壳
 
-- **Claude Code**：用本地 stdio 实测过。常驻的 HTTP 模式是这一版新加的，能连上，但没有在答题测试里用过。
+- **Claude Code**：用本地 stdio 实测过。常驻的 HTTP 模式是 0.1.0 加的，能连上，但没有在答题测试里用过。
 - **VS Code（Copilot）、Cursor 和其他 MCP 客户端**：给了配置示例。按协议应该能连上，但我们没有实测。
 - **外壳不支持 MCP？** 能读文件的外壳可以改用导出的文件版。我们只在 Claude Code 里测过：它通过了事先定的小检查，所以没有 MCP 时，推荐用它代替单个整篇文本文件。它的花费约是通过 MCP 的两倍。
 
@@ -148,9 +165,13 @@ claude mcp add --transport stdio vestigium -- vestigium mcp
 | [各客户端的接法](docs/CLIENTS_ZH.md) | Claude Code、VS Code、Cursor、HTTP 模式、文件版导出 |
 | [工具说明](docs/TOOLS_ZH.md) | 6 个工具、地址写法、白名单、开关 |
 | [结果](docs/RESULTS_ZH.md) | 测了什么，说明了什么 |
+| [结果：0.1.1](docs/RESULTS_0_1_1_ZH.md) | 0.1.1 有什么变化，附数字 |
 | [方法](docs/METHODS_ZH.md) | 怎么保证公平，怎么复现 |
 | [同类项目](docs/RELATED_ZH.md) | 树形导航和分层检索的相关工作 |
 | [局限和常见问题](docs/FAQ_ZH.md) | 已知弱点和常见问题 |
+| [阅读语言](docs/LANGUAGE_ZH.md) | 记轨迹、写规则用的那门小语言 |
+| [轨迹](docs/TRACES_ZH.md) | 一份文档是怎么读的：怎么问 AI 助手，存了什么 |
+| [规则](docs/RULES_ZH.md) | 以后该怎么读：写规则、预演、撤销、恢复出厂、全部关掉 |
 
 ## 名字
 

@@ -92,13 +92,13 @@ Only P with Haiku produced answer points the judge marked as made up: 6 points. 
 - **Figures.** Small models remain weak; Opus was not run on figure questions.
 - **Per-request billing.** If your plan charges per request rather than per token, saving tokens may not save money. We have not checked this.
 
-## This release and the tested version
+## 0.1.0 and the tested version
 
-The numbers above are for the version we tested in October 2026. This release adds the features described in [Tools](TOOLS.md), some of them switched on by default. Before release we checked that it does not do worse:
+The numbers above are for the version we tested in October 2026. 0.1.0 adds the features described in [Tools](TOOLS.md), some of them switched on by default. Before release we checked that it does not do worse:
 
-- **How:** 65 development questions, Claude Haiku 4.5, one run each, this release paired with the tested version; graded blind by an AI judge, with five no-regression rules fixed before the runs.
-- **Result:** mean strict accuracy 97.2% for this release against 97.1% for the tested version; cost 0.92 of the tested version; all five rules passed.
-- **Reading:** no regression. The difference is too small to call this release better, and development questions are easier than the confirmation questions.
+- **How:** 65 development questions, Claude Haiku 4.5, one run each, 0.1.0 paired with the tested version; graded blind by an AI judge, with five no-regression rules fixed before the runs.
+- **Result:** mean strict accuracy 97.2% for 0.1.0 against 97.1% for the tested version; cost 0.92 of the tested version; all five rules passed.
+- **Reading:** no regression. The difference is too small to call 0.1.0 better, and development questions are easier than the confirmation questions.
 - **Not kept:** a hint asking the model to answer item by item scored 1.5 points lower on 21 questions, so it stays off.
 - **Figures:** choosing the picture scale from the smallest text did no worse than the fixed scale on 15 development questions that need a figure, so it is on by default. A note giving the token cost of pictures did not help and stays off. Haiku remains weak at figures.
 

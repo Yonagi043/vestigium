@@ -1,0 +1,13 @@
+{
+ "release": "0.1.1",
+ "entries": [
+  {
+   "id": "rec-continues",
+   "kind": "rule",
+   "ver": 1,
+   "lang": 0,
+   "text": "on continues where pages<=2 in all do add next-page max 1",
+   "why": "recommended in v0.1.1: follow a section that continues on the next page"
+  }
+ ]
+}

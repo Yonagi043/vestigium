@@ -50,8 +50,8 @@ def real_manifest(task: str) -> dict[str, Any]:
 
 
 def code_version(producers: list[str]) -> str | None:
-    """A task's version where no delivered MANIFEST names one (a product library): its newest
-    producer's, e.g. ["tglw.textloss v1", "tglw.textloss.patch v2"] -> "v2"."""
+    """A task's version where no delivered MANIFEST names one (a product library): the highest
+    version among its producers, e.g. ["module.a v1", "module.b v3"] -> "v3"."""
     vs = [p.rsplit(" ", 1)[-1] for p in producers if " v" in p]
     return max(vs, key=lambda v: tuple(int(x) for x in v[1:].split(".") if x.isdigit()), default=None)
 

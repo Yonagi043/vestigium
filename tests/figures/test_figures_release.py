@@ -256,3 +256,154 @@ def test_drawing_found_next_to_a_caption_without_a_picture():
     assert drawings._find(SimpleNamespace(by_page={1: [cap, pic]}), page, 1, cap) is None  # Docling has it
     pdf.close()
     few_pdf.close()
+
+
+def recorded(tool: str, fn):
+    """Run fn inside a recorded call; return its result and the call event."""
+    from tglw.trace import record
+
+    events: list[dict] = []
+    record.set_sink(events.append)
+    try:
+        with record.call(tool, {"doc": "doc"}):
+            out = fn()
+    finally:
+        record.set_sink(None)
+    return out, events[-1]
+
+
+def record_problems(ev: dict) -> list[str]:
+    from tglw.trace import record
+
+    return record.validate(ev)
+
+
+def test_scan_marks_are_traced_without_changing_the_read(monkeypatch):
+    monkeypatch.setattr(ocr, "scanned", lambda name, page: page in (15, 16))
+    monkeypatch.delenv("TGLW_TRACE", raising=False)
+    text = "== p14 (printed 8) ==\nA\n== p15 (printed 9) ==\nB\n== p16 ==\nC"
+    plain = ocr.mark_read("doc", text)
+    out, ev = recorded("read", lambda: ocr.mark_read("doc", text))
+    assert out == plain
+    assert ev["sig"] == [{"k": "scan", "pages": [15, 16]}]
+    (d,) = ev["dec"]
+    assert (d["k"], d["by"], d["src"], d["pages"]) == ("scan_notes", "tool", "TGLW_VIS_OCR_NOTE", [15, 16]) and d["tokens"] > 20
+    assert record_problems(ev) == []
+    monkeypatch.setenv("TGLW_TRACE", "0")
+    from tglw.trace import record
+
+    events: list[dict] = []
+    record.set_sink(events.append)
+    try:
+        with record.call("read", {"doc": "doc"}):
+            assert ocr.mark_read("doc", text) == plain
+    finally:
+        record.set_sink(None)
+    assert events == []
+
+
+def test_outline_counts_and_figure_lines_are_traced(monkeypatch):
+    monkeypatch.setattr(counts, "section_figures", lambda name: {"s4": 3})
+    text = "doc · 15 pages\ns4 3 Model Architecture · p2-6 · 2.4k"
+    out, ev = recorded("outline", lambda: counts.mark_outline("doc", text))
+    assert out.endswith("· 3 fig") and ev["dec"][0]["k"] == "fig_hints"
+    assert ev["dec"][0]["src"] == "TGLW_VIS_OUTLINE_FIGS" and ev["dec"][0]["tokens"] > 0
+    assert inline.applied("[fig7: Figure 8 · 2000 · +3 labels; read fig7 for all] (image: region fig7)", "fig7") == {
+        "FIG_HINT", "FIG_LABELS"}
+    assert inline.applied("[fig7, labels by OCR: x]", "fig7") == {"OCR_NOTE"}
+    assert inline.applied("[fig7: x]", "fig7") == set()
+
+
+def test_auto_zoom_is_traced(monkeypatch):
+    monkeypatch.setattr(zoom, "em_of", lambda name, page, b: 6.0)
+    scale, ev = recorded("region", lambda: zoom.default_scale("any", 1, (0.0, 100.0, 100.0, 0.0)))
+    assert scale == 3.0
+    assert ev["dec"] == [{"k": "auto_zoom", "by": "tool", "src": "TGLW_VIS_ADAPTIVE_ZOOM", "scale": 3.0, "em_pt": 6.0}]
+
+
+def test_trace_errors_never_reach_the_tool(monkeypatch):
+    """Counting tokens fails, then the recorder itself fails: results stay the same, the losses are counted."""
+    from tglw.common import text as text_mod
+    from tglw.trace import record
+
+    monkeypatch.setattr(ocr, "scanned", lambda name, page: page == 15)
+    monkeypatch.setattr(counts, "section_figures", lambda name: {"s4": 3})
+    monkeypatch.setattr(zoom, "em_of", lambda name, page, b: 6.0)
+    monkeypatch.delenv("TGLW_TRACE", raising=False)
+    page = "== p15 (printed 9) ==\nB"
+    outline = "doc · 15 pages\ns4 3 Model Architecture · p2-6 · 2.4k"
+    plain = (ocr.mark_read("doc", page), counts.mark_outline("doc", outline), zoom.default_scale("d", 1, (0.0, 100.0, 100.0, 0.0)))
+
+    def broken(*a, **k):
+        raise RuntimeError("injected")
+
+    def run() -> tuple:
+        return (ocr.mark_read("doc", page), counts.mark_outline("doc", outline), zoom.default_scale("d", 1, (0.0, 100.0, 100.0, 0.0)))
+
+    monkeypatch.setattr(text_mod, "count_tokens", broken)
+    out, ev = recorded("read", run)
+    assert out == plain
+    assert [d["tokens"] for d in ev["dec"] if d["k"] != "auto_zoom"] == [None, None]
+    monkeypatch.setattr(record, "dec", broken)
+    out, ev = recorded("read", run)
+    assert out == plain
+    _, nxt = recorded("read", lambda: None)
+    assert nxt["lost"]["error:fig_tokens"] == 2
+    assert {"error:_report_scan", "error:_report_counts", "error:_report_zoom"} <= set(nxt["lost"])
+
+
+def fake_region(sizes: dict[str, tuple[int, int]]):
+    from tglw.mcp_server import tools
+
+    def render(name, target, scale=None):
+        w, h = sizes[target] if scale is None else (round(sizes[target][0] * scale / 1.5), round(sizes[target][1] * scale / 1.5))
+        return tools.Region(f"{target} · p1 · {w}×{h} px · about {round(w * h / 750)} image tokens", b"png", w, h, "")
+    return render
+
+
+def test_add_image_candidates_follow_the_read(monkeypatch):
+    from tglw.figures import actions
+
+    monkeypatch.setattr(actions, "_is_figure", lambda name, ref: ref != "#/pictures/2")  # fig2 is a logo
+    monkeypatch.setattr(ocr, "scanned", lambda name, page: page in (15, 16))
+    text = ("== p14 ==\n[fig2]\n[fig5: Figure 1 · 10 · 20] (image: region fig5)\n[tab4 3×2]\na | b\n"
+            "== p15 · scanned, OCR text ==\n[fig7, labels by OCR: x]\n[tab4 3×2 cont. of tab3]\n== p16 ==\n[fig5]")
+    assert actions.candidates("d", "figure", text) == ["fig5", "fig7"]
+    assert actions.candidates("d", "table", text) == ["tab4"]
+    assert actions.candidates("d", "scan", text) == ["p15", "p16"]
+    with pytest.raises(ValueError):
+        actions.candidates("d", "chart", text)
+    assert [actions.target_key(t) for t in ("#/pictures/3", " fig3 ", "#/tables/4", "p15", "p15:1,2,3,4")] == [
+        "fig3", "fig3", "tab4", "p15", "p15:1,2,3,4"]
+
+
+def test_add_image_skips_seen_and_too_big(monkeypatch):
+    from tglw.figures import actions
+
+    monkeypatch.setattr(actions, "_is_figure", lambda name, ref: True)
+    monkeypatch.setattr(actions.region, "region", fake_region({"fig5": (900, 900), "fig7": (600, 450), "fig9": (300, 300)}))
+    text = "[fig5: a]\n[fig7: b]\n[fig9: c]"
+    got = actions.add_image("d", "figure", text, seen={"#/pictures/7"}, limit=800, prefix="[rule r-1: add image] ")
+    assert got.target == "fig9" and got.img_tokens == 120 and got.skipped == [{"what": "fig5", "why": "budget"}]
+    assert got.line.startswith("[rule r-1: add image] fig9 · p1 · 300×300 px") and got.tokens > got.img_tokens
+    assert actions.add_image("d", "figure", text, seen={"fig9", "fig7"}, limit=800, why="call") == [{"what": "fig5", "why": "call"}]
+    assert actions.add_image("d", "figure", "no figures here", seen=set(), limit=800) == []
+
+
+def test_zoom_takes_the_larger_scale_and_skips_small_gains(monkeypatch):
+    from tglw.figures import actions
+    from tglw.mcp_server import tools
+
+    render = fake_region({"fig3": (600, 400), "p2": (900, 1160)})
+    monkeypatch.setattr(actions.region, "region", render)
+    boxes = {"fig3": (0.0, 300.0, 400.0, 0.0), "p2": None}
+    monkeypatch.setattr(actions.tools, "_target_box", lambda name, t: (1, boxes[t], t))
+    monkeypatch.setattr(actions.zoom, "chosen_scale", lambda name, page, box, base=1.5: 1.8 if box else base)
+    shown = render("d", "fig3", 1.8)
+    z = actions.zoom_view("d", "fig3", 3, shown)
+    assert (z.scale_from, z.scale_to, z.region.width) == (1.8, 3.0, 1200) and z.tokens > 0
+    assert actions.zoom_view("d", "fig3", 1.5, shown) == []  # E3 already chose more
+    assert actions.zoom_view("d", "p2", 3, render("d", "p2")) == []  # whole pages are not enlarged
+    assert actions.zoom_view("d", "fig3", 3, shown, limit=10) == [{"what": "fig3", "why": "budget"}]
+    monkeypatch.setattr(actions.region, "region", lambda name, t, scale=None: tools.Region("c", b"", 760, 520, ""))
+    assert actions.zoom_view("d", "fig3", 3, shown) == []  # the pixel caps leave it under 1.1x

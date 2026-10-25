@@ -7,7 +7,7 @@ Vestigium（迹）是一个 MCP 服务，有两种运行方式：
 - **本地（stdio）**：由软件自己启动 `vestigium mcp`，每个会话一份。我们就是这样测的。
 - **常驻的 HTTP 服务**：你先启动一次 `vestigium mcp --http`，它预先加载好文档，各个软件连到本机的一个地址。这样每开一个新会话，就省掉了启动的等待。
 
-只有 Claude Code 的 stdio 方式在答题中实测过。HTTP 模式是这一版新加的。其他软件的配置是照各自的官方文档写的，没有实测。
+只有 Claude Code 的 stdio 方式在答题中实测过。HTTP 模式是 0.1.0 加的。其他软件的配置是照各自的官方文档写的，没有实测。
 
 ## Claude Code（stdio 方式实测过）
 
@@ -17,7 +17,7 @@ Vestigium（迹）是一个 MCP 服务，有两种运行方式：
 claude mcp add --scope user --transport stdio vestigium -- vestigium mcp
 ```
 
-要传设置，就在名字前面加 `--env`，比如 `--env VESTIGIUM_HOME=/path/to/library` 或 `--env TGL_ALLOWED_DOCS=doc1,doc2`。
+要传设置，就在 `--transport` 前面加 `--env`，每个设置一个，比如 `claude mcp add --scope user --env VESTIGIUM_HOME=/path/to/library --env TGL_ALLOWED_DOCS=doc1,doc2 --transport stdio vestigium -- vestigium mcp`。
 
 **和项目一起共享。** `--scope project` 会把服务写进项目根目录的 `.mcp.json`，可以提交进版本库：
 

@@ -400,7 +400,7 @@ def a_controls(doc: Doc) -> list[Anchor]:
 
 def block_tops(doc: Doc) -> dict[str, str]:
     """Block ref -> numbering scope it sits in: the nearest ancestor node that some number_scope names
-    (task A v2), e.g. GPT-4's System Card. Without number_scope, the depth-1 ancestor."""
+    (in task A's structure sidecar), e.g. GPT-4's System Card. Without number_scope, the depth-1 ancestor."""
     side = structure(doc.name)
     if side is None:
         return {}

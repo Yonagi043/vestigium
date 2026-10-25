@@ -196,6 +196,12 @@ class DocView:
         return out
 
     @cached_property
+    def table_rows(self) -> frozenset[str]:
+        """Rows of a scanned table Docling labelled as headings (task SRC's TR sidecar, read only by its switch; it
+        is no sidecar version a return names)."""
+        return frozenset((sidecars.extra("TR", ".tablerows.json", self.name) or {}).get("table_rows") or ())
+
+    @cached_property
     def boxfix(self) -> dict[str, Any] | None:
         """Task D1 v3's box fixes, duplicate lines and rotated pages, read when an F4 switch is on."""
         return sidecars.extra("D1", ".boxfix.json", self.name)
