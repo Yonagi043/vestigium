@@ -2,7 +2,7 @@
 
 [中文](LANGUAGE_ZH.md) · [Traces](TRACES.md) · [Rules](RULES.md) · [README](../README.md)
 
-Vestigium has a small language for one thing: describing how a document is read. It is used in two directions.
+Vestigium has a small language, the V language (the Vestigium reading language), for one thing: describing how a document is read. It is used in two directions.
 
 - **Traces.** Vestigium writes down, in this language, how each reading went: which pages and sections were read, what each step was, which signals came back, and what the tool did by itself. See [Traces](TRACES.md).
 - **Rules.** Your agent writes, in this language, how future readings should go, for example "when a section goes on to the next page, read that page too". Vestigium then carries the rule out itself. See [Rules](RULES.md).

@@ -2,7 +2,7 @@
 
 [English](LANGUAGE.md) · [轨迹](TRACES_ZH.md) · [规则](RULES_ZH.md) · [README](../README_ZH.md)
 
-Vestigium（迹）有一门很小的语言，只做一件事：描述一份文档是怎么读的。它有两个方向的用法。
+Vestigium（迹）有一门很小的语言：V 语言（Vestigium 阅读语言）。它只做一件事：描述一份文档是怎么读的。它有两个方向的用法。
 
 - **轨迹**：Vestigium 用这门语言记下每次阅读的经过：读了哪些页和节、每一步做了什么、返回了哪些信号、工具自己替模型做了什么。见[轨迹](TRACES_ZH.md)。
 - **规则**：你的 AI 助手用这门语言写下以后该怎么读，比如“一节还没完、接到下一页时，把下一页也读上”。之后由 Vestigium 自己执行。见[规则](RULES_ZH.md)。

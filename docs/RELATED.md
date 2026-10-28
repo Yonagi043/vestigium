@@ -29,16 +29,17 @@ Sources were checked on 22 October 2026.
 
 ## Where Vestigium differs
 
-Much of Vestigium's reading approach is shared with the projects above: PageIndex also points to pages and runs locally, NavTree also builds its index without model calls, and DeepRead also gives an agent tools that read by address. What we can point to is mainly how Vestigium was tested. None of this is a claim of better results.
+Compared with PageIndex and other "vectorless RAG", Vestigium differs in method in three fundamental ways:
+
+- **No summaries, no retrieval pipeline: the agent reads the original text.** PageIndex has a model write summaries for a table-of-contents tree, retrieves over those summaries, and passes the selected text to the answering model. Vestigium builds its index with no model calls: it turns the document's own structure into addresses, and the agent answering the question reads the original text itself. Search is one step it can take or skip.
+- **Citations down to the document's own units.** PageIndex's open-source version cites pages (its hosted version, blocks). Vestigium pins down paragraphs, tables, figures, footnotes and printed page numbers, goes straight to the document's own numbered items such as `Note 7` or `AC-2(3)`, and can crop any box on a page.
+- **Reading you can see and steer.** In PageIndex, how a document gets read is model reasoning you cannot see. Vestigium formalizes reading as a language, the V language (the Vestigium reading language), built from 7 blocks and 5 kinds of logic. Every reading becomes a trace, and how to read becomes rules the tool carries out: edit, undo or reset them, and preview their effect on past readings first. See [The reading language](LANGUAGE.md).
+
+Also:
 
 - **Tested inside a real agent app, against fair baselines, with the method fixed in advance.** We measured Vestigium in Claude Code, with the app's own prompt, tools, limits and caching. The baselines were the app's own ways of reading: the whole text with its built-in search, and the PDF itself. Our first text baseline lost content because Claude Code hides long lines; we fixed that before the main test. The questions were new, the analysis was fixed in advance, and the numbers were recomputed independently. See [Methods](METHODS.md).
 - **Runs locally.** Parsing, indexing and serving all happen on your machine; the only model calls are the ones your agent makes.
-- **Reads by address.** The agent works through six tools that search and read sections, pages, tables and figures by short addresses, and every passage carries its PDF page.
 
-## What we have not done
+## Compare with us
 
-- Run any of these projects on our questions, or Vestigium on their benchmarks.
-- Compared index-building cost or time with them.
-- Tested Vestigium with non-Claude models.
-
-If you run such a comparison, we would like to hear about it.
+We have not yet run these projects on the same questions. Our benchmark package is public (see [Methods](METHODS.md)); run the comparison and tell us what you find.

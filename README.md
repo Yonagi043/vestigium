@@ -33,7 +33,13 @@ Answers were graded blind by an AI judge; a human spot check has not been done y
 - **Small models at about half the cost.** With Vestigium, the small Claude Haiku did no worse than with the whole text on hard questions, at about half the cost and time, and was far more accurate than reading the PDF.
 - **Also:** experimental Chinese support, a plain-file export for apps without MCP, pictures of figures and tables when text is not enough, and exact-text search that counts every match.
 
-Other projects also navigate long documents through trees or hierarchies, and some of them also run locally, build their index without model calls or point to pages; see [Similar projects](docs/RELATED.md). We have not compared Vestigium with them on the same questions.
+### How it differs from PageIndex and other "vectorless RAG"
+
+- **No summaries, no retrieval pipeline: the agent reads the original text.** PageIndex has a model write summaries for a table-of-contents tree, retrieves over those summaries, and passes the selected text to the answering model. Vestigium builds its index with no model calls: it turns the document's own structure into addresses, and the agent answering the question reads the original text itself. Search is one step it can take or skip.
+- **Citations down to the document's own units.** PageIndex's open-source version cites pages (its hosted version, blocks). Vestigium pins down paragraphs, tables, figures, footnotes and printed page numbers, goes straight to the document's own numbered items such as `Note 7` or `AC-2(3)`, and can crop any box on a page.
+- **Reading you can see and steer.** In PageIndex, how a document gets read is model reasoning you cannot see. Vestigium formalizes reading as a language, the V language (the Vestigium reading language), built from 7 blocks and 5 kinds of logic. Every reading becomes a trace you can follow step by step, and how to read becomes rules the tool carries out: edit, undo or reset them, preview their effect on past readings first, and keep tuning until it reads the way you want. See [The reading language](docs/LANGUAGE.md).
+
+More related work: [Similar projects](docs/RELATED.md).
 
 ## See it work
 
